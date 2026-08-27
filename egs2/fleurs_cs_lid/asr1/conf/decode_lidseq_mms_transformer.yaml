@@ -1,0 +1,8 @@
+beam_size: 5
+ctc_weight: 0.0
+lm_weight: 0.0
+penalty: 0.0
+# The target is a short language-label list, not a transcript.  A small cap
+# prevents pure-attention decoding from generating long label strings.
+maxlenratio: 0.05
+minlenratio: 0.0

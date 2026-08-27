@@ -22,6 +22,14 @@ min() {
     echo "${a}"
 }
 
+copy_lid_label_file() {
+    local srcdir=$1
+    local destdir=$2
+    if [ "${lid_label_file}" != utt2lang ] && [ -f "${srcdir}/${lid_label_file}" ]; then
+        cp "${srcdir}/${lid_label_file}" "${destdir}/${lid_label_file}"
+    fi
+}
+
 SECONDS=0
 
 # General configuration
@@ -64,6 +72,7 @@ lid_exp=              # Specify the directory path for lid experiment.
 lid_tag=              # Suffix to the result dir for lid model training.
 lid_config=           # Config for the lid model training.
 lid_args=             # Arguments for lid model training.
+lid_label_file=utt2lang  # File used as the lid_labels input.
 pretrained_model=     # Pretrained model to load
 ignore_init_mismatch=false      # Ignore initial mismatch
 
@@ -127,6 +136,7 @@ Options:
     lid_tag=              # Suffix to the result dir for lid model training.
     lid_config=           # Config for the lid model training.
     lid_args=             # Arguments for lid model training.
+    lid_label_file=utt2lang  # File used as the lid_labels input.
     pretrained_model=     # Pretrained model to load (default="${pretrained_model}").
     ignore_init_mismatch= # Ignore mismatch parameter init with pretrained model (default="${ignore_init_mismatch}").
 
@@ -181,6 +191,9 @@ fi
 
 # Extra files for language identification process
 utt_extra_files="utt2category"
+if [ "${lid_label_file}" != utt2lang ]; then
+    utt_extra_files+=" ${lid_label_file}"
+fi
 
 # Set tag for naming of model directory
 if [ -z "${lid_tag}" ]; then
@@ -244,6 +257,9 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ] && ! [[ " ${skip_stages} " =~ [
         log "Stage 2: Speed perturbation: data/${train_set} -> data/${train_set}_sp"
 
         _scp_list="wav.scp "
+        if [ "${lid_label_file}" != utt2lang ]; then
+            _scp_list+="${lid_label_file} "
+        fi
 
         # Temporary move to use perturb_lid_data_dir_speed.sh
         mv "data/${train_set}/utt2lang" "data/${train_set}/utt2spk"
@@ -294,6 +310,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     if [ "${feats_type}" = raw ]; then
         if [ "${skip_train}" = false ]; then
             local/copy_data_dir.sh --validate_opts --non-print data/"${train_set}" "${data_feats}/${train_set}"
+            copy_lid_label_file "data/${train_set}" "${data_feats}/${train_set}"
 
             # Copy extra files that are not covered by copy_data_dir.sh
             # category2utt will be used by data sampler
@@ -338,6 +355,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
 
         for dset in ${_dsets}; do
             local/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}/${dset}"
+            copy_lid_label_file "data/${dset}" "${data_feats}/${dset}"
 
             cp data/"${dset}/lang2utt" "${data_feats}/${dset}/category2utt"
 
@@ -360,6 +378,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     elif [ "${feats_type}" = raw_copy ]; then
         if [ "${skip_train}" = false ]; then
             local/copy_data_dir.sh --validate_opts --non-print data/"${train_set}" "${data_feats}/${train_set}"
+            copy_lid_label_file "data/${train_set}" "${data_feats}/${train_set}"
 
             cp data/"${train_set}/lang2utt" "${data_feats}/${train_set}/category2utt"
 
@@ -378,6 +397,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
 
         for dset in ${_dsets}; do
             local/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}/${dset}"
+            copy_lid_label_file "data/${dset}" "${data_feats}/${dset}"
 
             cp data/"${dset}/lang2utt" "${data_feats}/${dset}/category2utt"
 
@@ -491,10 +511,10 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
             --ignore_init_mismatch ${ignore_init_mismatch} \
             --output_dir ${lid_exp} \
             --train_data_path_and_name_and_type ${_lid_train_dir}/wav.scp,speech,sound \
-            --train_data_path_and_name_and_type ${_lid_train_dir}/utt2lang,lid_labels,text \
+            --train_data_path_and_name_and_type ${_lid_train_dir}/${lid_label_file},lid_labels,text \
             --train_shape_file ${lid_stats_dir}/train/speech_shape \
             --valid_data_path_and_name_and_type ${_lid_valid_dir}/wav.scp,speech,sound \
-            --valid_data_path_and_name_and_type ${_lid_valid_dir}/utt2lang,lid_labels,text \
+            --valid_data_path_and_name_and_type ${_lid_valid_dir}/${lid_label_file},lid_labels,text \
             --lang2utt ${_lid_train_dir}/lang2utt \
             --lang_num $(wc -l ${_lid_train_dir}/lang2utt | cut -f1 -d" ") \
             --fold_length ${fold_length} \
@@ -618,7 +638,7 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
             --output_dir ${infer_exp} \
             --dtype float32 \
             --data_path_and_name_and_type "${_inference_dir}/wav.scp,speech,sound" \
-            --data_path_and_name_and_type "${_inference_dir}/utt2lang,lid_labels,text" \
+            --data_path_and_name_and_type "${_inference_dir}/${lid_label_file},lid_labels,text" \
             --valid_batch_size ${inference_batch_size} \
             --lid_train_config "${lid_exp}/config.yaml" \
             --lid_model_file "${lid_exp}"/${inference_model} \

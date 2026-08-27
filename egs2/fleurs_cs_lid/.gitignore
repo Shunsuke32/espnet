@@ -1,0 +1,12 @@
+**/data/
+**/dump/
+**/downloads/
+**/exp/
+**/hub/
+**/conf/generated/
+*.log
+*.out
+nohup.out
+**/result_for_paper/
+__pycache__/
+*.pyc

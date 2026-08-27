@@ -66,9 +66,22 @@ class ESPnetASRModel(AbsESPnetModel):
         autocast_frontend: bool = False,
         extract_feats_in_collect_stats: bool = True,
         lang_token_id: int = -1,
+        lidseq_order_insensitive_loss: bool = False,
+        lidseq_order_insensitive_reduction: str = "min",
     ):
         assert 0.0 <= ctc_weight <= 1.0, ctc_weight
         assert 0.0 <= interctc_weight < 1.0, interctc_weight
+        if lidseq_order_insensitive_loss:
+            if ctc_weight != 0.0:
+                raise ValueError(
+                    "lidseq_order_insensitive_loss currently supports attention-only "
+                    f"LID sequence training, but ctc_weight={ctc_weight}"
+                )
+            if lidseq_order_insensitive_reduction != "min":
+                raise ValueError(
+                    "Unsupported lidseq_order_insensitive_reduction="
+                    f"{lidseq_order_insensitive_reduction!r}; supported: 'min'"
+                )
 
         super().__init__()
         # NOTE (Shih-Lun): else case is for OpenAI Whisper ASR model,
@@ -91,6 +104,8 @@ class ESPnetASRModel(AbsESPnetModel):
         self.interctc_weight = interctc_weight
         self.aux_ctc = aux_ctc
         self.token_list = token_list.copy()
+        self.lidseq_order_insensitive_loss = lidseq_order_insensitive_loss
+        self.lidseq_order_insensitive_reduction = lidseq_order_insensitive_reduction
 
         self.frontend = frontend
         self.specaug = specaug
@@ -184,6 +199,12 @@ class ESPnetASRModel(AbsESPnetModel):
             if report_cer or report_wer:
                 self.error_calculator = ErrorCalculator(
                     token_list, sym_space, sym_blank, report_cer, report_wer
+                )
+
+            if self.lidseq_order_insensitive_loss:
+                logging.info(
+                    "Enabled order-insensitive LID sequence attention loss "
+                    f"(reduction={self.lidseq_order_insensitive_reduction})"
                 )
 
         if ctc_weight == 0.0:
@@ -559,6 +580,12 @@ class ESPnetASRModel(AbsESPnetModel):
         ys_pad_lens: torch.Tensor,
     ):
         if hasattr(self, "lang_token_id") and self.lang_token_id is not None:
+            if self.lidseq_order_insensitive_loss:
+                raise RuntimeError(
+                    "lidseq_order_insensitive_loss does not support lang_token_id "
+                    "prefixing because it would make the LID permutation target "
+                    "ambiguous."
+                )
             ys_pad = torch.cat(
                 [
                     self.lang_token_id.repeat(ys_pad.size(0), 1).to(ys_pad.device),
@@ -577,7 +604,17 @@ class ESPnetASRModel(AbsESPnetModel):
         )
 
         # 2. Compute attention loss
-        loss_att = self.criterion_att(decoder_out, ys_out_pad)
+        if self.lidseq_order_insensitive_loss:
+            loss_att = self._calc_order_insensitive_lidseq_att_loss(
+                encoder_out,
+                encoder_out_lens,
+                ys_pad,
+                ys_pad_lens,
+                decoder_out,
+                ys_out_pad,
+            )
+        else:
+            loss_att = self.criterion_att(decoder_out, ys_out_pad)
         acc_att = th_accuracy(
             decoder_out.view(-1, self.vocab_size),
             ys_out_pad,
@@ -592,6 +629,91 @@ class ESPnetASRModel(AbsESPnetModel):
             cer_att, wer_att = self.error_calculator(ys_hat.cpu(), ys_pad.cpu())
 
         return loss_att, acc_att, cer_att, wer_att
+
+    def _calc_label_smoothing_loss_per_sample(
+        self,
+        decoder_out: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return unreduced per-utterance attention losses.
+
+        This mirrors LabelSmoothingLoss but keeps the batch dimension so the
+        LID sequence PIT branch can choose the best label permutation per
+        utterance.
+        """
+        criterion = self.criterion_att
+        assert decoder_out.size(2) == criterion.size
+        batch_size, maxlen, vocab_size = decoder_out.size()
+        x = decoder_out.reshape(-1, vocab_size)
+        target = target.reshape(-1)
+        with torch.no_grad():
+            true_dist = x.clone()
+            true_dist.fill_(criterion.smoothing / (criterion.size - 1))
+            ignore = target == criterion.padding_idx
+            target = target.masked_fill(ignore, 0)
+            true_dist.scatter_(1, target.unsqueeze(1), criterion.confidence)
+        kl = criterion.criterion(torch.log_softmax(x, dim=1), true_dist)
+        token_loss = kl.masked_fill(ignore.unsqueeze(1), 0).sum(dim=1)
+        return token_loss.reshape(batch_size, maxlen).sum(dim=1)
+
+    def _reduce_lidseq_per_sample_loss(
+        self,
+        per_sample_loss: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.criterion_att.normalize_length:
+            denom = (target != self.ignore_id).sum().clamp(min=1)
+            return per_sample_loss.sum() / denom
+        return per_sample_loss.mean()
+
+    def _calc_order_insensitive_lidseq_att_loss(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        ys_pad: torch.Tensor,
+        ys_pad_lens: torch.Tensor,
+        decoder_out: torch.Tensor,
+        ys_out_pad: torch.Tensor,
+    ) -> torch.Tensor:
+        if int(ys_pad_lens.max()) > 2:
+            raise RuntimeError(
+                "lidseq_order_insensitive_loss only supports 1- or 2-token "
+                f"LID sequence targets, but got max length {int(ys_pad_lens.max())}"
+            )
+
+        original_loss = self._calc_label_smoothing_loss_per_sample(
+            decoder_out,
+            ys_out_pad,
+        )
+        two_token = ys_pad_lens == 2
+        if not bool(two_token.any()):
+            return self._reduce_lidseq_per_sample_loss(original_loss, ys_out_pad)
+
+        swapped_ys_pad = ys_pad.clone()
+        swapped_ys_pad[two_token, 0] = ys_pad[two_token, 1]
+        swapped_ys_pad[two_token, 1] = ys_pad[two_token, 0]
+        swapped_ys_in_pad, swapped_ys_out_pad = add_sos_eos(
+            swapped_ys_pad,
+            self.sos,
+            self.eos,
+            self.ignore_id,
+        )
+        swapped_decoder_out, _ = self.decoder(
+            encoder_out,
+            encoder_out_lens,
+            swapped_ys_in_pad,
+            ys_pad_lens + 1,
+        )
+        swapped_loss = self._calc_label_smoothing_loss_per_sample(
+            swapped_decoder_out,
+            swapped_ys_out_pad,
+        )
+        selected_loss = torch.where(
+            two_token,
+            torch.minimum(original_loss, swapped_loss),
+            original_loss,
+        )
+        return self._reduce_lidseq_per_sample_loss(selected_loss, ys_out_pad)
 
     def _calc_ctc_loss(
         self,

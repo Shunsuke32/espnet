@@ -1,0 +1,1 @@
+../../lid1/local/make_fixed_batch_config.py

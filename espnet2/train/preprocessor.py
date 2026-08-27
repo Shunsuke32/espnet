@@ -2507,6 +2507,93 @@ class LIDPreprocessor(CommonPreprocessor):
         return data
 
 
+class LIDSoftLabelPreprocessor(LIDPreprocessor):
+    """Preprocessor for LID targets with one or more language labels.
+
+    ``LIDPreprocessor`` maps a single language string to one integer class id.
+    This subclass keeps the same speech processing path but maps whitespace
+    separated labels to a dense distribution, e.g. ``"eng"`` -> 1.0 for eng and
+    ``"ara eng"`` -> 0.5 for ara and 0.5 for eng.
+    """
+
+    def _text_process(
+        self, data: Dict[str, Union[str, np.ndarray]]
+    ) -> Dict[str, np.ndarray]:
+        raw_labels = data["lid_labels"]
+        if isinstance(raw_labels, np.ndarray):
+            if raw_labels.ndim == 0:
+                raw_labels = str(raw_labels.item())
+            else:
+                raw_labels = " ".join(map(str, raw_labels.tolist()))
+        labels = str(raw_labels).strip().split()
+        if not labels:
+            raise ValueError("empty LID soft-label target")
+        if len(labels) > 2:
+            raise ValueError(
+                f"LID soft-label target supports at most 2 labels: {labels}"
+            )
+
+        target = np.zeros(len(self.lang2label), dtype=np.float32)
+        weight = 1.0 / len(labels)
+        seen_labels = set()
+        for label in labels:
+            label = label.strip()
+            if label.startswith("<") and label.endswith(">"):
+                label = label[1:-1]
+            if label in seen_labels:
+                raise ValueError(f"duplicate LID label in soft target: {label}")
+            seen_labels.add(label)
+            if label not in self.lang2label:
+                raise KeyError(f"unknown LID label for soft target: {label}")
+            target[self.lang2label[label]] += weight
+
+        data["lid_labels"] = target
+        return data
+
+
+class LIDMultiLabelPreprocessor(LIDPreprocessor):
+    """Preprocessor for sigmoid/BCE LID targets.
+
+    The input label string may contain one or two canonical language labels.
+    The output is a multi-hot float vector: ``"eng"`` gives 1.0 for English,
+    while ``"ara eng"`` gives 1.0 for both Arabic and English.
+    """
+
+    def _text_process(
+        self, data: Dict[str, Union[str, np.ndarray]]
+    ) -> Dict[str, np.ndarray]:
+        raw_labels = data["lid_labels"]
+        if isinstance(raw_labels, np.ndarray):
+            if raw_labels.ndim == 0:
+                raw_labels = str(raw_labels.item())
+            else:
+                raw_labels = " ".join(map(str, raw_labels.tolist()))
+
+        labels = str(raw_labels).strip().split()
+        if not labels:
+            raise ValueError("empty LID multi-label target")
+        if len(labels) > 2:
+            raise ValueError(
+                f"LID multi-label target supports at most 2 labels: {labels}"
+            )
+
+        target = np.zeros(len(self.lang2label), dtype=np.float32)
+        seen_labels = set()
+        for label in labels:
+            label = label.strip()
+            if label.startswith("<") and label.endswith(">"):
+                label = label[1:-1]
+            if label in seen_labels:
+                raise ValueError(f"duplicate LID label in multi-label target: {label}")
+            seen_labels.add(label)
+            if label not in self.lang2label:
+                raise KeyError(f"unknown LID label for multi-label target: {label}")
+            target[self.lang2label[label]] = 1.0
+
+        data["lid_labels"] = target
+        return data
+
+
 class S2TPreprocessor(CommonPreprocessor):
     def __init__(
         self,

@@ -2,7 +2,7 @@
 # c9ec537b53fe1e04525be74b2550ee95bed3a891/wespeaker/models/projections.py#L243
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -190,3 +190,195 @@ class ArcMarginProduct_intertopk_subcenter(AbsLoss):
 
         loss = self.ce(output, label)
         return loss, accuracy, preds
+
+
+class ArcMarginProduct_intertopk_subcenter_softtarget(
+    ArcMarginProduct_intertopk_subcenter
+):
+    """ArcFace loss with support for soft class targets.
+
+    This variant keeps the same projection/margin logic as
+    ``ArcMarginProduct_intertopk_subcenter`` but accepts either hard integer
+    labels or a dense target distribution of shape ``(batch, nclasses)``.
+    Multi-label LID can therefore use targets such as 0.5/0.5 for two
+    languages while preserving the existing MMS+ECAPA classifier shape.  Dense
+    targets are optimized with KL(target || prediction).
+    """
+
+    def forward(
+        self, input: torch.Tensor, label: Optional[torch.Tensor] = None
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        cosine = torch.reshape(cosine, (-1, self.out_features, self.K))
+        cosine, _ = torch.max(cosine, 2)
+
+        preds = torch.argmax(cosine, dim=1)
+
+        if label is None:
+            return None, None, preds
+
+        if label.dim() == 2 and label.size(1) == self.out_features:
+            target = label.to(dtype=cosine.dtype)
+            target_sum = target.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
+            target = target / target_sum
+            positive_mask = target > 0
+        else:
+            if len(label.size()) == 2:
+                label = label.squeeze(1)
+            label = label.long()
+            target = torch.zeros_like(cosine)
+            target.scatter_(1, label.view(-1, 1), 1.0)
+            positive_mask = target > 0
+
+        accuracy = positive_mask.gather(1, preds.view(-1, 1)).float().mean()
+
+        sine = torch.sqrt(torch.clamp(1.0 - torch.pow(cosine, 2), min=0.0))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        phi_mp = cosine * self.cos_mp + sine * self.sin_mp
+
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mmm)
+
+        positive_one_hot = positive_mask.to(dtype=cosine.dtype)
+
+        if self.k_top > 0:
+            _, top_k_index = torch.topk(cosine - 2 * positive_one_hot, self.k_top)
+            top_k_one_hot = input.new_zeros(cosine.size()).scatter_(1, top_k_index, 1)
+            output = (
+                positive_one_hot * phi
+                + top_k_one_hot * phi_mp
+                + (1.0 - positive_one_hot - top_k_one_hot) * cosine
+            )
+        else:
+            output = positive_one_hot * phi + (1.0 - positive_one_hot) * cosine
+
+        output *= self.scale
+        loss = F.kl_div(F.log_softmax(output, dim=1), target, reduction="batchmean")
+        return loss, accuracy, preds
+
+
+class ArcMarginProduct_intertopk_subcenter_multilabel_bce(
+    ArcMarginProduct_intertopk_subcenter
+):
+    """Sub-center cosine classifier optimized with multi-label BCE.
+
+    The training logits apply the ArcFace margin to every positive label and
+    the Inter-TopK penalty to the hardest negatives. Inference logits do not
+    depend on labels and are scaled cosine similarities.
+    """
+
+    def __init__(
+        self,
+        nout: int,
+        nclasses: int,
+        scale: float = 32.0,
+        margin: float = 0.2,
+        easy_margin: bool = False,
+        K: int = 3,
+        mp: float = 0.06,
+        k_top: int = 5,
+        do_lm: bool = False,
+        threshold: float = 0.5,
+        pos_weight: Optional[Union[float, Sequence[float]]] = None,
+        apply_margin: bool = True,
+    ):
+        super().__init__(
+            nout=nout,
+            nclasses=nclasses,
+            scale=scale,
+            margin=margin,
+            easy_margin=easy_margin,
+            K=K,
+            mp=mp,
+            k_top=k_top,
+            do_lm=do_lm,
+        )
+        self.nclasses = int(nclasses)
+        self.threshold = float(threshold)
+        self.apply_margin = bool(apply_margin)
+
+        if pos_weight is None:
+            pos_weight_tensor = None
+        elif isinstance(pos_weight, (float, int)):
+            pos_weight_tensor = torch.full((nclasses,), float(pos_weight))
+        else:
+            if len(pos_weight) != nclasses:
+                raise ValueError(
+                    f"pos_weight must have {nclasses} values, got {len(pos_weight)}"
+                )
+            pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32)
+
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+
+    def _cosine(self, input: torch.Tensor) -> torch.Tensor:
+        if input.dim() != 2:
+            raise ValueError(f"expected input shape (batch, dim), got {input.shape}")
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        cosine = torch.reshape(cosine, (-1, self.out_features, self.K))
+        cosine, _ = torch.max(cosine, 2)
+        return cosine
+
+    def _target_mask(
+        self, label: torch.Tensor, ref: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if label.dim() == 2 and label.size(1) == self.out_features:
+            target = label.to(dtype=ref.dtype)
+            positive_mask = target > 0
+        else:
+            if len(label.size()) == 2:
+                label = label.squeeze(1)
+            label = label.long()
+            target = torch.zeros_like(ref)
+            target.scatter_(1, label.view(-1, 1), 1.0)
+            positive_mask = target > 0
+        if target.shape != ref.shape:
+            raise ValueError(
+                f"target shape {target.shape} does not match logits {ref.shape}"
+            )
+        return target, positive_mask
+
+    def compute_logits(
+        self, input: torch.Tensor, label: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        cosine = self._cosine(input)
+        if label is None or not self.apply_margin:
+            return cosine * self.scale
+
+        _, positive_mask = self._target_mask(label, cosine)
+        sine = torch.sqrt(torch.clamp(1.0 - torch.pow(cosine, 2), min=0.0))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        phi_mp = cosine * self.cos_mp + sine * self.sin_mp
+
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mmm)
+
+        positive_one_hot = positive_mask.to(dtype=cosine.dtype)
+        if self.k_top > 0:
+            _, top_k_index = torch.topk(cosine - 2 * positive_one_hot, self.k_top)
+            top_k_one_hot = input.new_zeros(cosine.size()).scatter_(1, top_k_index, 1)
+            output = (
+                positive_one_hot * phi
+                + top_k_one_hot * phi_mp
+                + (1.0 - positive_one_hot - top_k_one_hot) * cosine
+            )
+        else:
+            output = positive_one_hot * phi + (1.0 - positive_one_hot) * cosine
+        return output * self.scale
+
+    def forward(
+        self, input: torch.Tensor, label: Optional[torch.Tensor] = None
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+        if label is None:
+            return None, None, self.compute_logits(input)
+
+        logits = self.compute_logits(input, label)
+        target, _ = self._target_mask(label, logits)
+        loss = self.bce(logits, target)
+        pred = torch.sigmoid(logits) >= self.threshold
+        gold = target >= 0.5
+        accuracy = pred.eq(gold).all(dim=1).float().mean()
+        return loss, accuracy, logits
