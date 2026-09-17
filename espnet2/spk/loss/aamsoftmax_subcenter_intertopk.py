@@ -192,6 +192,22 @@ class ArcMarginProduct_intertopk_subcenter(AbsLoss):
         return loss, accuracy, preds
 
 
+def _stable_sine(cosine: torch.Tensor) -> torch.Tensor:
+    # ArcFace's derivative is singular at +/-1, including AMP-rounded cosines.
+    if cosine.dtype in (torch.float16, torch.bfloat16):
+        cosine = cosine.float()
+    return (1.0 - cosine.square()).clamp_min(torch.finfo(cosine.dtype).eps).sqrt()
+
+
+def _topk_negative_mask(
+    cosine: torch.Tensor, positive_mask: torch.Tensor, k_top: int
+) -> torch.Tensor:
+    scores = cosine.masked_fill(positive_mask, float("-inf"))
+    indices = scores.topk(min(k_top, cosine.size(1)), dim=1).indices
+    mask = torch.zeros_like(cosine).scatter_(1, indices, 1.0)
+    return mask.masked_fill(positive_mask, 0.0)
+
+
 class ArcMarginProduct_intertopk_subcenter_softtarget(
     ArcMarginProduct_intertopk_subcenter
 ):
@@ -232,7 +248,7 @@ class ArcMarginProduct_intertopk_subcenter_softtarget(
 
         accuracy = positive_mask.gather(1, preds.view(-1, 1)).float().mean()
 
-        sine = torch.sqrt(torch.clamp(1.0 - torch.pow(cosine, 2), min=0.0))
+        sine = _stable_sine(cosine)
         phi = cosine * self.cos_m - sine * self.sin_m
         phi_mp = cosine * self.cos_mp + sine * self.sin_mp
 
@@ -244,8 +260,7 @@ class ArcMarginProduct_intertopk_subcenter_softtarget(
         positive_one_hot = positive_mask.to(dtype=cosine.dtype)
 
         if self.k_top > 0:
-            _, top_k_index = torch.topk(cosine - 2 * positive_one_hot, self.k_top)
-            top_k_one_hot = input.new_zeros(cosine.size()).scatter_(1, top_k_index, 1)
+            top_k_one_hot = _topk_negative_mask(cosine, positive_mask, self.k_top)
             output = (
                 positive_one_hot * phi
                 + top_k_one_hot * phi_mp
@@ -347,7 +362,7 @@ class ArcMarginProduct_intertopk_subcenter_multilabel_bce(
             return cosine * self.scale
 
         _, positive_mask = self._target_mask(label, cosine)
-        sine = torch.sqrt(torch.clamp(1.0 - torch.pow(cosine, 2), min=0.0))
+        sine = _stable_sine(cosine)
         phi = cosine * self.cos_m - sine * self.sin_m
         phi_mp = cosine * self.cos_mp + sine * self.sin_mp
 
@@ -358,8 +373,7 @@ class ArcMarginProduct_intertopk_subcenter_multilabel_bce(
 
         positive_one_hot = positive_mask.to(dtype=cosine.dtype)
         if self.k_top > 0:
-            _, top_k_index = torch.topk(cosine - 2 * positive_one_hot, self.k_top)
-            top_k_one_hot = input.new_zeros(cosine.size()).scatter_(1, top_k_index, 1)
+            top_k_one_hot = _topk_negative_mask(cosine, positive_mask, self.k_top)
             output = (
                 positive_one_hot * phi
                 + top_k_one_hot * phi_mp

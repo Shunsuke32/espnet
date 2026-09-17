@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# FLEURS-only ESPnet lid1 baseline recipe.
-# Trains the closed-set LID classifier used for:
-#   1) FLEURS top-1 LID accuracy
-#   2) CS-FLEURS softmax top-2 unordered set baseline
-#
-# Training policy mirrors asr1:
-#   - default training uses 2 GPUs
-#   - ESPnet2 batch_size is global; it is not multiplied by ngpu
-#   - use fixed utterance-count mini-batches, not batch_bins/catpow bins
-#   - effective batch size = train_batch_size * accum_grad = 32
-#   - max_epoch fixed to 30; total exposure about 3 passes over train_fleurs_lid
-
-train_set=train_fleurs_lid
-valid_set=valid_fleurs_lid
-test_sets="test_fleurs_lid"
-tsne_set="test_fleurs_lid"
+# One ESPnet LID recipe for hard, soft KL, and multi-hot BCE targets.
+# The model and preprocessor are selected by --lid_config.
+profile=fleurs_only
+train_set=
+valid_set=
+test_sets=
+tsne_set=
 
 ngpu=2
 nj=32
@@ -24,18 +15,20 @@ dumpdir=dump
 gpu_inference=true
 num_nodes=1
 stage=1
-stop_stage=7
-feats_type=raw
+stop_stage=5
+feats_type=
 fs=16k
 audio_format=wav
-# Duration filtering is performed deterministically in local/data.sh. These
-# options are retained for compatibility with the LID template interface.
-min_wav_duration=0.999999
-max_wav_duration=30
+# Source metadata filtering is followed by a recipe-local actual-length view
+# for hard/BCE raw runs. KL mixed and every CS-all run retain source membership.
+min_wav_duration=1.0
+max_wav_duration=
 expdir=exp
 lid_config=conf/train_fleurs_lid_mms_ecapa.yaml
 lid_tag=
 lid_args=
+lid_label_file=
+lid_stats_dir=
 inference_model=valid.accuracy.best.pth
 inference_batch_size=4
 extract_embd=false
@@ -44,35 +37,30 @@ extract_embd=false
 auto_training_budget=true
 enforce_training_policy=true
 require_cuda_visible_devices=true
-train_batch_size=8
+train_batch_size=
 batch_size=   # alias: --batch_size 32/16/8/4 may be used instead of --train_batch_size
-accum_grad=4
+accum_grad=
 effective_batch_size=32
 target_passes=3.0
-budget_max_epoch=30
+budget_max_epoch=
 warmup_ratio=0.1
-round_updates_per_epoch_to=10
-fixed_batch_type=catbel
+round_updates_per_epoch_to=
+fixed_batch_type=
 drop_last_iter=true
 generated_config_dir=conf/generated
 budget_count_file=wav.scp
-
-run_topk_baselines=false
-topk=2
-baseline_batch_size=8
-baseline_num_workers=4
-apply_loss_scale=false
 
 # Data options. cs_root is optional for training but needed for CS-FLEURS eval.
 fleurs_config=all
 fleurs_download_dir=${FLEURS:-downloads/fleurs}
 fleurs_tsv_root=
+fleurs_audio_root=
 fleurs_cache_dir=downloads/cache
 fleurs_revision=70bb2e84b976b7e960aa89f1c648e09c59f894dd
 fleurs_manifest_root=
 fleurs_subsample_per_lang=0
 skip_fleurs=false
-skip_fleurs_download=false
+skip_fleurs_download=true
 cs_root=${CS_FLEURS_ROOT:-}
 cs_train_subsets="xtts/train"
 cs_eval_subsets="read/test,xtts/test1,xtts/test2,mms/test"
@@ -99,12 +87,111 @@ min_eval_duration_sec=-1.0
 max_eval_duration_sec=0.0
 duration_missing_policy=error
 
-default_lid_config=${lid_config}
-
 . utils/parse_options.sh
 
+case "${audio_format}" in
+  *ark*)
+    echo "Error: this LID recipe trains with sound inputs; use wav or flac, not an archive format." >&2
+    exit 2
+    ;;
+esac
+
+if [ "${stop_stage}" -gt 5 ]; then
+  echo "Error: use local/evaluate.sh for LID top-k and threshold evaluation after Stage 5." >&2
+  exit 2
+fi
+
+# Read only the routing defaults here; ESPnet validates the complete YAML.
+config_defaults=$(python3 - "${lid_config}" <<'PY'
+import sys
+import yaml
+with open(sys.argv[1], encoding="utf-8") as handle:
+    config = yaml.safe_load(handle)
+preprocessor = config.get("preprocessor", "lid")
+if preprocessor not in {"lid", "lid_softlabel", "lid_multilabel"}:
+    raise SystemExit("Expected a LID hard, soft-label, or multi-label preprocessor")
+print("utt2lang" if preprocessor == "lid" else "utt2langs")
+print(config.get("max_epoch", 30))
+print(config.get("batch_type", "catbel"))
+print(preprocessor)
+PY
+)
+readarray -t config_defaults <<< "${config_defaults}"
+: "${lid_label_file:=${config_defaults[0]}}"
+: "${budget_max_epoch:=${config_defaults[1]}}"
+: "${fixed_batch_type:=${config_defaults[2]}}"
+if [ -z "${round_updates_per_epoch_to}" ]; then
+  round_updates_per_epoch_to=10
+  # The 15-epoch KL run doubled the 30-epoch budget's iterations exactly.
+  [ "${budget_max_epoch}" -eq 15 ] && round_updates_per_epoch_to=20
+fi
+if [ "${lid_label_file}" != "${config_defaults[0]}" ]; then
+  echo "Error: ${lid_config} requires ${config_defaults[0]}, got ${lid_label_file}" >&2
+  exit 2
+fi
+
+case "${profile}" in
+  fleurs_only)
+    : "${train_set:=train_fleurs_lid}"
+    : "${valid_set:=valid_fleurs_lid}"
+    : "${max_wav_duration:=30}"
+    ;;
+  mixed|csall)
+    data_target=lidseq
+    [ "${lid_label_file}" = utt2lang ] && data_target=lid_pair_cs
+    if [ "${profile}" = csall ]; then
+      [ "${data_target}" = lidseq ] && data_target=lidseq_csall_yodas
+      [ "${data_target}" = lid_pair_cs ] && data_target=lid_pair_csall_yodas
+      : "${max_wav_duration:=70}"
+    else
+      : "${max_wav_duration:=30}"
+    fi
+    : "${train_set:=train_${data_target}}"
+    : "${valid_set:=valid_${data_target}}"
+    ;;
+  *) echo "Error: profile must be fleurs_only, mixed, or csall" >&2; exit 2 ;;
+esac
+historical_feats_type=raw
+default_batch=8
+default_accum=4
+case "${config_defaults[3]}:${profile}" in
+  lid:csall|lid_multilabel:mixed) default_batch=4; default_accum=8 ;;
+  lid_multilabel:fleurs_only) default_batch=16; default_accum=2 ;;
+esac
+: "${train_batch_size:=${default_batch}}"
+: "${accum_grad:=${default_accum}}"
+if [ "${profile}" = csall ] || [ "${config_defaults[3]}" = lid_softlabel ]; then
+  historical_feats_type=raw_copy
+fi
+: "${feats_type:=${historical_feats_type}}"
+if [ "${feats_type}" != "${historical_feats_type}" ]; then
+  echo "Error: OLD ${profile}/${config_defaults[3]} requires --feats_type ${historical_feats_type}; changing it changes historical membership." >&2
+  exit 2
+fi
+case "${fs}" in
+  16k|16000) ;;
+  *) echo "Error: OLD duration/sample-count identity requires --fs 16k." >&2; exit 2 ;;
+esac
+if [ "${min_wav_duration}" != 1.0 ] && [ "${min_wav_duration}" != 1 ]; then
+  echo "Error: OLD raw filtering requires the strict 1-second lower bound." >&2
+  exit 2
+fi
+if [ -z "${test_sets}" ]; then
+  test_sets="test_fleurs_lid"
+  [ -n "${cs_root}" ] && test_sets+=" test_cs_read_test test_cs_xtts_test1 test_cs_xtts_test2 test_cs_mms_test"
+  [ -n "${cs_yodas_root}" ] && test_sets+=" test_yodas_lidseq"
+fi
+if [ "${stage}" -le 1 ] && [ "${profile}" != fleurs_only ] && [ -z "${cs_root}" ]; then
+  echo "Error: mixed and csall preparation require --cs_root" >&2
+  exit 2
+fi
+if [ "${stage}" -le 1 ] && [ "${profile}" = csall ] && [ -z "${cs_yodas_root}" ]; then
+  echo "Error: csall preparation requires --cs_yodas_root" >&2
+  exit 2
+fi
+
 needs_training_or_eval_gpu() {
-  [ "${ngpu}" -gt 0 ] && [ "${stage}" -le 8 ] && [ "${stop_stage}" -ge 5 ]
+  [ "${ngpu}" -gt 0 ] && [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]
 }
 
 check_no_protected_args() {
@@ -139,14 +226,14 @@ validate_training_policy() {
     echo "Error: effective_batch_size must be 32; got ${effective_batch_size}" >&2
     exit 2
   }
-  [ "${budget_max_epoch}" -eq 30 ] || {
-    echo "Error: budget_max_epoch must be 30; got ${budget_max_epoch}" >&2
+  [ "${budget_max_epoch}" -eq 30 ] || [ "${budget_max_epoch}" -eq 15 ] || {
+    echo "Error: budget_max_epoch must be 30 or 15; got ${budget_max_epoch}" >&2
     exit 2
   }
   case "${target_passes}" in
-    3|3.0|3.00|3.000) ;;
+    3|3.0|3.00|3.000|5|5.0) ;;
     *)
-      echo "Error: target_passes must be 3.0; got ${target_passes}" >&2
+      echo "Error: target_passes must be 3 or 5; got ${target_passes}" >&2
       exit 2
       ;;
   esac
@@ -190,13 +277,19 @@ if [ "${ngpu}" -gt 1 ] && [ $((train_batch_size % ngpu)) -ne 0 ]; then
   echo "Error: train_batch_size=${train_batch_size} must be divisible by ngpu=${ngpu} for equal per-GPU utterance counts." >&2
   exit 2
 fi
+if needs_training_or_eval_gpu && [ $((train_batch_size / ngpu)) -lt 2 ]; then
+  echo "Error: ECAPA training requires at least 2 utterances per GPU for BatchNorm." >&2
+  exit 2
+fi
 validate_training_policy
 validate_cuda_visible_devices
 
 base_name=$(basename "${lid_config}" .yaml)
 model_label=${base_name#train_fleurs_lid_}
 [ "${model_label}" = "${base_name}" ] && model_label=${base_name#train_}
-[ -z "${lid_tag}" ] && lid_tag="fleurs_lid_${model_label}_bs${train_batch_size}_ag${accum_grad}_eb${effective_batch_size}_3pass30ep"
+schedule_name="${target_passes%.*}pass${budget_max_epoch}ep"
+[ -z "${lid_tag}" ] && lid_tag="${train_set}_${model_label}_bs${train_batch_size}_ag${accum_grad}_eb${effective_batch_size}_${schedule_name}"
+[ -z "${lid_stats_dir}" ] && lid_stats_dir="${expdir}/lid_stats_${lid_tag}"
 
 local_data_opts=(
   --fleurs_config "${fleurs_config}"
@@ -211,7 +304,6 @@ local_data_opts=(
   --cs_dev_ratio "${cs_dev_ratio}"
   --cs_split_mode "${cs_split_mode}"
   --cs_pair_field "${cs_pair_field}"
-  --cs_yodas_root "${cs_yodas_root}"
   --cs_yodas_train_ratio "${cs_yodas_train_ratio}"
   --cs_yodas_valid_ratio "${cs_yodas_valid_ratio}"
   --cs_yodas_split_seed "${cs_yodas_split_seed}"
@@ -229,11 +321,23 @@ local_data_opts=(
   --duration_missing_policy "${duration_missing_policy}"
 )
 [ -n "${cs_root}" ] && local_data_opts+=(--cs_root "${cs_root}")
+[ -n "${cs_yodas_root}" ] && local_data_opts+=(--cs_yodas_root "${cs_yodas_root}")
 [ -n "${fleurs_cache_dir}" ] && local_data_opts+=(--fleurs_cache_dir "${fleurs_cache_dir}")
 [ -n "${fleurs_manifest_root}" ] && local_data_opts+=(--fleurs_manifest_root "${fleurs_manifest_root}")
+[ -n "${fleurs_audio_root}" ] && local_data_opts+=(--fleurs_audio_root "${fleurs_audio_root}")
 [ -n "${label_map}" ] && local_data_opts+=(--label_map "${label_map}")
 
-gen_prefix="${generated_config_dir}/${base_name}_${train_set}_bs${train_batch_size}_ag${accum_grad}_eb${effective_batch_size}_3pass30ep"
+if [ "${stage}" -le 1 ]; then
+  for root in "${fleurs_tsv_root}" "${fleurs_audio_root}" "${fleurs_manifest_root}" "${fleurs_download_dir}" "${fleurs_cache_dir}" "${cs_root}" "${cs_yodas_root}" "${label_map}"; do
+    case "${root}" in
+      *[[:space:]]*)
+        echo "Error: wrapper Stage 1 does not support whitespace in input paths. Run local/data.sh directly with quoted paths, then start the wrapper at Stage 3." >&2
+        exit 2 ;;
+    esac
+  done
+fi
+
+gen_prefix="${generated_config_dir}/${base_name}_${train_set}_${fixed_batch_type}_bs${train_batch_size}_ag${accum_grad}_eb${effective_batch_size}_${schedule_name}"
 verify_allow_pair_labels=false
 case " ${train_set} ${valid_set} ${test_sets} " in
   *lid_pair*) verify_allow_pair_labels=true ;;
@@ -243,7 +347,7 @@ validate_generated_budget() {
   local budget_json=$1
   python3 local/validate_fixed_batch_budget.py \
     --budget_json "${budget_json}" \
-    --train_dir "data/${train_set}" \
+    --train_dir "${budget_train_dir}" \
     --count_file "${budget_count_file}" \
     --task lid \
     --batch_size "${train_batch_size}" \
@@ -258,30 +362,81 @@ validate_generated_budget() {
     --drop_last_iter "${drop_last_iter}"
 }
 
-budget_prepared_data=false
-if "${auto_training_budget}" && [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
-  if [ ! -s "data/${train_set}/${budget_count_file}" ] || [ "${stage}" -le 1 ]; then
-    echo "Preparing data before generating 3-pass training budget for ${train_set}" >&2
-    local/data.sh "${local_data_opts[@]}"
-    budget_prepared_data=true
+local_data_opts_str="${local_data_opts[*]}"
+if [ "${stage}" -gt 1 ] && [ "${stage}" -le 5 ]; then
+  if [ ! -s "data/${train_set}/${budget_count_file}" ]; then
+    echo "Error: missing prepared data for ${train_set}; run Stage 1 explicitly. Resume never regenerates data." >&2
+    exit 2
+  fi
+  verify_require_cs=true
+  [ -z "${cs_root}" ] && verify_require_cs=false
+  local/verify_lid_data.sh \
+    --data_dir data --require_cs "${verify_require_cs}" \
+    --train_set "${train_set}" --valid_set "${valid_set}" --test_sets "${test_sets}" \
+    --min_train_duration_sec 1.0 --max_train_duration_sec "${max_wav_duration}" \
+    --max_non_yodas_train_duration_sec 30.0 --max_yodas_train_duration_sec 70.0 \
+    --allow_pair_labels "${verify_allow_pair_labels}"
+fi
+invoke_template() {
+  ./lid.sh \
+    --stage "$1" --stop_stage "$2" --dumpdir "$3" \
+    --ngpu "${ngpu}" --num_nodes "${num_nodes}" --nj "${nj}" \
+    --gpu_inference "${gpu_inference}" --feats_type "${feats_type}" \
+    --fs "${fs}" --audio_format "${audio_format}" \
+    --min_wav_duration "${min_wav_duration}" --max_wav_duration "${max_wav_duration}" \
+    --train_set "${train_set}" --valid_set "${valid_set}" --test_sets "${test_sets}" \
+    --tsne_set "${tsne_set}" --expdir "${expdir}" --lid_config "${lid_config}" \
+    --lid_label_file "${lid_label_file}" --lid_stats_dir "${lid_stats_dir}" \
+    --lid_tag "${lid_tag}" --lid_args "${lid_args}" \
+    --inference_model "${inference_model}" --inference_batch_size "${inference_batch_size}" \
+    --extract_embd "${extract_embd}" --local_data_opts "${local_data_opts_str}"
+}
+
+# Preserve the standard Stage 3 format / Stage 4 stats / Stage 5 train boundary.
+if [ "${stage}" -le 3 ]; then
+  preparation_stop=${stop_stage}
+  [ "${preparation_stop}" -gt 3 ] && preparation_stop=3
+  invoke_template "${stage}" "${preparation_stop}" "${dumpdir}"
+fi
+training_dumpdir=${dumpdir}
+budget_train_dir="data/${train_set}"
+if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 3 ]; then
+  if [ "${feats_type}" = raw ]; then
+    training_dumpdir="${dumpdir}/old_duration"
+    for dset in "${train_set}" "${valid_set}"; do
+      python3 ../local/finalize_duration_view.py \
+        --input-dir "${dumpdir}/raw/${dset}" --source-data-dir "data/${dset}" \
+        --mode raw --output-dir "${training_dumpdir}/raw/${dset}" --reuse-existing
+    done
+    budget_train_dir="${training_dumpdir}/raw/${train_set}"
   else
-    verify_require_cs=true
-    [ -z "${cs_root}" ] && verify_require_cs=false
-    local/verify_lid_data.sh \
-      --data_dir data \
-      --require_cs "${verify_require_cs}" \
-      --train_set "${train_set}" \
-      --valid_set "${valid_set}" \
-      --test_sets "${test_sets}" \
-      --max_train_duration_sec "${max_wav_duration}" \
-      --allow_pair_labels "${verify_allow_pair_labels}"
+    # Audit only: KL mixed historically reads the direct metadata membership.
+    # CS-all likewise keeps OLD raw_copy counts, including the Persian record.
+    raw_copy_audit_opts=(--require-no-drops)
+    if [ "${profile}" != csall ] && [ "${config_defaults[3]}" = lid_softlabel ]; then
+      # Direct-data KL used metadata 1s <= duration < 30s, not strict sample bounds.
+      raw_copy_audit_opts=()
+      echo "KL raw_copy: preserving direct-data metadata membership (1s inclusive); strict-sample exclusions below are diagnostic only." >&2
+    fi
+    for dset in "${train_set}" "${valid_set}"; do
+      python3 ../local/finalize_duration_view.py \
+        --input-dir "${dumpdir}/raw_copy/${dset}" --source-data-dir "data/${dset}" \
+        --mode raw_copy --audit-only "${raw_copy_audit_opts[@]}"
+    done
+  fi
+fi
+
+if "${auto_training_budget}" && [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 ]; then
+  if [ ! -s "${budget_train_dir}/${budget_count_file}" ]; then
+    echo "Error: missing prepared training view; run Stages 1-3 explicitly. Resume never regenerates source data." >&2
+    exit 2
   fi
   mkdir -p "${generated_config_dir}" data/local
   python3 local/make_fixed_batch_config.py \
     --task lid \
     --base_config "${lid_config}" \
     --output_config "${gen_prefix}.yaml" \
-    --train_dir "data/${train_set}" \
+    --train_dir "${budget_train_dir}" \
     --count_file "${budget_count_file}" \
     --batch_size "${train_batch_size}" \
     --accum_grad "${accum_grad}" \
@@ -299,82 +454,9 @@ if "${auto_training_budget}" && [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 5 
   cat "data/local/budget_lid_${train_set}_bs${train_batch_size}_ag${accum_grad}.log" >&2
   validate_generated_budget "${gen_prefix}.budget.json" >&2
   lid_config="${gen_prefix}.yaml"
-elif "${auto_training_budget}" && [ "${stage}" -gt 5 ] && [ "${stop_stage}" -ge 6 ]; then
-  case "${lid_config}" in
-    ${generated_config_dir}/*.yaml)
-      [ -s "${lid_config}" ] || {
-        echo "Error: explicit generated LID config missing: ${lid_config}" >&2
-        exit 2
-      }
-      validate_generated_budget "${lid_config%.yaml}.budget.json" >&2
-      ;;
-    *)
-      if [ -s "${gen_prefix}.yaml" ]; then
-        lid_config="${gen_prefix}.yaml"
-        validate_generated_budget "${gen_prefix}.budget.json" >&2
-      else
-        echo "Error: generated LID config missing for resume: ${gen_prefix}.yaml" >&2
-        echo "Run this wrapper once with --stage 1 --stop_stage 5 for the same train_batch_size/accum_grad, or pass the matching generated --lid_config explicitly." >&2
-        exit 2
-      fi
-      ;;
-  esac
 fi
-
-if "${budget_prepared_data}" && ! "${skip_fleurs}" && [ -z "${fleurs_manifest_root}" ]; then
-  # Freeze the TSVs that were just used for budget generation before lid.sh
-  # calls local/data.sh again.
-  local_data_opts+=(--skip_fleurs_download true --fleurs_tsv_root "${fleurs_tsv_root}")
-fi
-local_data_opts_str="${local_data_opts[*]}"
-
-if [ "${stage}" -le 7 ]; then
-  ./lid.sh \
-    --stage "${stage}" \
-    --stop_stage "${stop_stage}" \
-    --ngpu "${ngpu}" \
-    --num_nodes "${num_nodes}" \
-    --nj "${nj}" \
-    --dumpdir "${dumpdir}" \
-    --gpu_inference "${gpu_inference}" \
-    --feats_type "${feats_type}" \
-    --fs "${fs}" \
-    --audio_format "${audio_format}" \
-    --min_wav_duration "${min_wav_duration}" \
-    --max_wav_duration "${max_wav_duration}" \
-    --train_set "${train_set}" \
-    --valid_set "${valid_set}" \
-    --test_sets "${test_sets}" \
-    --tsne_set "${tsne_set}" \
-    --expdir "${expdir}" \
-    --lid_config "${lid_config}" \
-    --lid_tag "${lid_tag}" \
-    --lid_args "${lid_args}" \
-    --inference_model "${inference_model}" \
-    --inference_batch_size "${inference_batch_size}" \
-    --extract_embd "${extract_embd}" \
-    --local_data_opts "${local_data_opts_str}"
-fi
-
-if "${run_topk_baselines}" && [ "${stage}" -le 7 ] && [ "${stop_stage}" -ge 7 ]; then
-  extra=()
-  "${apply_loss_scale}" && extra+=(--apply_loss_scale)
-  case "${feats_type}" in
-    raw) data_feats="${dumpdir}/raw" ;;
-    raw_copy) data_feats="${dumpdir}/raw_copy" ;;
-    fbank) data_feats="${dumpdir}/fbank" ;;
-    extracted) data_feats="${dumpdir}/extracted" ;;
-    *) data_feats="${dumpdir}/${feats_type}" ;;
-  esac
-  local/score_lid_topk.sh \
-    --ngpu "${ngpu}" \
-    --topk "${topk}" \
-    --batch_size "${baseline_batch_size}" \
-    --num_workers "${baseline_num_workers}" \
-    --expdir "${expdir}" \
-    --lid_tag "${lid_tag}" \
-    --inference_model "${inference_model}" \
-    --data_feats "${data_feats}" \
-    --label_map "data/local/label_map.used.tsv" \
-    "${extra[@]}"
+if [ "${stage}" -le 5 ] && [ "${stop_stage}" -ge 4 ]; then
+  training_stage=${stage}
+  [ "${training_stage}" -lt 4 ] && training_stage=4
+  invoke_template "${training_stage}" "${stop_stage}" "${training_dumpdir}"
 fi

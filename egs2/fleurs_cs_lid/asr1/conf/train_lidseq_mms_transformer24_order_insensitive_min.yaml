@@ -1,6 +1,6 @@
 frontend: s3prl
 frontend_conf:
-  fs: 16k
+  fs: 16000
   frontend_conf:
     upstream: hf_wav2vec2_custom
     path_or_url: facebook/mms-1b
@@ -34,8 +34,8 @@ model_conf:
   ctc_weight: 0.0
   lsm_weight: 0.1
   length_normalized_loss: false
-  lidseq_order_insensitive_loss: true
-  lidseq_order_insensitive_reduction: min
+  pit_loss: true
+  pit_loss_reduction: min
 freeze_param:
 - frontend.upstream
 num_att_plot: 0
@@ -51,8 +51,8 @@ best_model_criterion:
 - - valid
   - loss
   - min
-max_epoch: 30
-num_iters_per_epoch: 640
+max_epoch: 10
+num_iters_per_epoch: 3880
 batch_type: sorted
 accum_grad: 4
 optim: adam
@@ -63,12 +63,11 @@ optim_conf:
   - 0.98
 scheduler: warmuplr
 scheduler_conf:
-  warmup_steps: 960
+  warmup_steps: 2910
 batch_size: 8
 valid_batch_size: 8
 drop_last_iter: true
 sort_in_batch: descending
 sort_batch: descending
-# Same model as train_lidseq_mms_transformer24.yaml, but the attention loss
-# treats 2-token LID targets as unordered by taking the minimum loss over
-# original and swapped label orders.
+# FLEURS+CS-FLEURS frozen prefix: 10 validation epochs, about one pass.
+# run.sh recomputes the budget when batch size or data membership changes.

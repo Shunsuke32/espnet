@@ -97,9 +97,14 @@ class ESPnetLIDModel(AbsESPnetModel):
         # 4. Calculate loss
         # NOTE: If lid_labels is None, loss and accuracy are None
 
-        loss, accuracy, pred_lids = self.loss(lang_embd, lid_labels)
+        loss, accuracy, pred_lids = self.loss(
+            lang_embd, None if extract_embd else lid_labels
+        )
 
         if extract_embd:
+            # Keep the single-label embedding API; BCE score sweeps use compute_logits.
+            if pred_lids.ndim == 2:
+                pred_lids = pred_lids.argmax(dim=1)
             return lang_embd, pred_lids
 
         stats["loss"] = loss.detach()

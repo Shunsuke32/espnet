@@ -47,6 +47,9 @@ FIELDS = [
     "num_samples",
     "sampling_rate",
     "duration",
+    "source_path",
+    "raw_transcription",
+    "transcription",
 ]
 
 PAPER_FLEURS_REVISION = "70bb2e84b976b7e960aa89f1c648e09c59f894dd"
@@ -113,6 +116,13 @@ def materialize_audio(
     )
 
     if dest.exists() and dest.stat().st_size > 0:
+        expected = (
+            hashlib.sha256(audio_bytes).hexdigest()
+            if audio_bytes is not None
+            else sha256_file(Path(src_text))
+        )
+        if sha256_file(dest) != expected:
+            raise ValueError(f"cached audio content mismatch: {dest}")
         return str(dest.resolve())
 
     if audio_bytes is None:
@@ -148,6 +158,14 @@ def maybe_int(x: object) -> Optional[int]:
         return int(x)
     except Exception:
         return None
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def maybe_float(x: object) -> Optional[float]:
@@ -327,6 +345,9 @@ def google_fleurs_row(
         "num_samples": "" if ns is None else ns,
         "sampling_rate": sr,
         "duration": "" if dur is None else f"{dur:.9f}",
+        "source_path": get_audio_path(row),
+        "raw_transcription": row.get("raw_transcription") or "",
+        "transcription": row.get("transcription") or "",
     }
 
 
@@ -339,31 +360,15 @@ def limited_rows(
         yield row
 
 
-def ordered_langs_in_tsv(path: Path) -> list[str]:
-    langs: list[str] = []
-    seen = set()
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        for row in reader:
-            lang = str(row.get("lang_id_name") or "")
-            if lang and lang not in seen:
-                seen.add(lang)
-                langs.append(lang)
-    return langs
-
-
-def existing_partial_tsvs(
-    out_root: Path, split_map: Dict[str, str]
-) -> Optional[Dict[str, Path]]:
-    found: Dict[str, Path] = {}
-    for hf_split, out_name in split_map.items():
-        matches = sorted(
-            out_root.glob(f".{out_name}.tsv.tmp.*"), key=lambda p: p.stat().st_mtime
+def check_partial_tsvs(out_root: Path) -> None:
+    # A language's presence does not prove its final split finished streaming.
+    # Restart from pinned inputs, reusing only content-verified audio payloads.
+    partials = sorted(out_root.glob(".*.tsv.tmp.*"))
+    if partials:
+        raise RuntimeError(
+            f"Unverified partial TSVs in {out_root}; cannot resume safely. "
+            "Rerun with --resume_partial false to rebuild TSVs from pinned inputs."
         )
-        if not matches:
-            return None
-        found[hf_split] = matches[-1]
-    return found
 
 
 def write_google_fleurs(
@@ -388,51 +393,23 @@ def write_google_fleurs(
     final_paths = {}
     tmp_paths = {}
     success = False
-    start_idx = 0
-    resume_paths = (
-        existing_partial_tsvs(out_root, split_map) if resume_partial else None
-    )
+    if resume_partial:
+        check_partial_tsvs(out_root)
     try:
         for hf_split, out_name in split_map.items():
             p = out_root / f"{out_name}.tsv"
-            if resume_paths is not None:
-                tmp = resume_paths[hf_split]
-                f = tmp.open("a", encoding="utf-8", newline="")
-            else:
-                tmp = out_root / f".{out_name}.tsv.tmp.{os.getpid()}"
-                f = tmp.open("w", encoding="utf-8", newline="")
+            tmp = out_root / f".{out_name}.tsv.tmp.{os.getpid()}"
+            f = tmp.open("w", encoding="utf-8", newline="")
             files[hf_split] = f
             final_paths[hf_split] = p
             tmp_paths[hf_split] = tmp
             w = csv.DictWriter(
                 f, delimiter="\t", fieldnames=FIELDS, extrasaction="ignore"
             )
-            if resume_paths is None:
-                w.writeheader()
+            w.writeheader()
             writers[hf_split] = w
 
-        if resume_paths is not None:
-            lang_lists = {
-                split: ordered_langs_in_tsv(path)
-                for split, path in resume_paths.items()
-            }
-            train_langs = lang_lists["train"]
-            if any(langs != train_langs for langs in lang_lists.values()):
-                raise RuntimeError(
-                    f"partial TSV split language lists disagree: {lang_lists}"
-                )
-            if tuple(train_langs) != tuple(configs[: len(train_langs)]):
-                raise RuntimeError(
-                    "partial TSV language order does not match requested configs: "
-                    f"partial={train_langs[:5]}... n={len(train_langs)}"
-                )
-            start_idx = len(train_langs)
-            print(
-                f"Resuming google/fleurs TSV creation from config {start_idx + 1}/{len(configs)}",
-                flush=True,
-            )
-
-        for lang_id, cfg in enumerate(configs[start_idx:], start=start_idx):
+        for lang_id, cfg in enumerate(configs):
             print(
                 f"Loading google/fleurs config {lang_id + 1}/{len(configs)}: {cfg}",
                 flush=True,
@@ -465,7 +442,7 @@ def write_google_fleurs(
         if success:
             for hf_split in split_map:
                 os.replace(tmp_paths[hf_split], final_paths[hf_split])
-        elif resume_paths is None:
+        else:
             for tmp in tmp_paths.values():
                 try:
                     tmp.unlink()
@@ -479,6 +456,10 @@ def write_google_fleurs(
                 "dataset": "google/fleurs",
                 "revision": revision,
                 "configs": list(configs),
+                "subsample_per_lang": subsample_per_lang,
+                "tsv_sha256": {
+                    path.name: sha256_file(path) for path in final_paths.values()
+                },
             },
             indent=2,
             sort_keys=True,

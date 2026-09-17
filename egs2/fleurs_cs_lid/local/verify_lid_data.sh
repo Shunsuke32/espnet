@@ -73,15 +73,15 @@ with open(wav_scp, encoding="utf-8") as f:
     for lineno, line in enumerate(f, 1):
         parts = line.rstrip("\n").split(maxsplit=1)
         if len(parts) != 2:
-            continue
+            raise SystemExit(f"malformed {wav_scp}:{lineno}")
         utt, wav = parts
         wav = wav.strip()
         # ESPnet/Kaldi wav.scp can also contain shell pipelines.  Those are
         # validated later by formatting; here we catch ordinary path mistakes.
-        if wav.endswith("|") or " " in wav:
+        if wav.endswith("|"):
             continue
         checked += 1
-        if not os.path.isfile(wav) or not os.access(wav, os.R_OK):
+        if not os.path.isfile(wav) or not os.access(wav, os.R_OK) or os.path.getsize(wav) == 0:
             bad.append((lineno, utt, wav))
             if len(bad) >= 5:
                 break
@@ -105,6 +105,26 @@ if [ -f "${official_map}" ]; then
   [ "${n_official}" -eq 102 ] || fail "expected 102 FLEURS labels, got ${n_official}"
   [ "${n_unique}" -eq 102 ] || fail "expected 102 unique FLEURS canonical labels, got ${n_unique}"
 fi
+
+python3 - "${data_dir}" "${selected_names[@]}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+for name in sys.argv[2:]:
+    split = name.removeprefix("dur70_").split("_", 1)[0]
+    path = root / name / "wav.scp"
+    if split not in {"train", "valid"} or not path.exists():
+        continue
+    with path.open() as handle:
+        for line in handle:
+            utt = line.split(maxsplit=1)[0]
+            if not utt.startswith("cs_xtts_train_"):
+                continue
+            valid = int(hashlib.sha1(utt.encode()).hexdigest()[:12], 16) / float(16**12) < 0.02
+            if valid != (split == "valid"):
+                raise SystemExit(f"{path}: {utt} violates OLD global_hash 0.02 membership")
+PY
 
 for name in "${selected_names[@]}"; do
   d="${data_dir}/${name}"
@@ -146,6 +166,7 @@ wavs = read_kv(data_dir / "wav.scp")
 text = read_kv(data_dir / "text", labels=True)
 utt2langs = read_kv(data_dir / "utt2langs", labels=True)
 utt2lang = read_kv(data_dir / "utt2lang", labels=True)
+utt2spk = read_kv(data_dir / "utt2spk")
 metadata = {}
 with (data_dir / "labels.jsonl").open(encoding="utf-8") as f:
     for lineno, line in enumerate(f, 1):
@@ -162,6 +183,7 @@ for name, rows in (
     ("text", text),
     ("utt2langs", utt2langs),
     ("utt2lang", utt2lang),
+    ("utt2spk", utt2spk),
     ("labels.jsonl", metadata),
 ):
     if set(rows) != expected:
@@ -173,6 +195,8 @@ for name, rows in (
         )
 
 for utt in sorted(expected):
+    if metadata[utt].get("wav") != wavs[utt]:
+        raise SystemExit(f"recording path mismatch in {data_dir}/{utt}")
     labels = utt2langs[utt]
     metadata_labels = tuple(str(x) for x in metadata[utt].get("labels", []))
     if text[utt] != labels or metadata_labels != labels:
@@ -332,7 +356,7 @@ with open(text_file, encoding="utf-8") as f:
             lab = tok.strip("<>")
             if lab in labels:
                 continue
-            if allow_pair and pair_re.fullmatch(lab):
+            if allow_pair and pair_re.fullmatch(lab) and all(x in labels for x in lab.split("-")):
                 continue
             print(f"unknown target token: {lab} in {text_file}:{lineno}: {line.rstrip()}", file=sys.stderr)
             sys.exit(1)
@@ -360,7 +384,7 @@ with open(utt2langs_file, encoding="utf-8") as f:
             lab = lab.strip("<>")
             if lab in labels:
                 continue
-            if allow_pair and pair_re.fullmatch(lab):
+            if allow_pair and pair_re.fullmatch(lab) and all(x in labels for x in lab.split("-")):
                 continue
             print(f"unknown utt2langs token: {lab} in {utt2langs_file}:{lineno}: {line.rstrip()}", file=sys.stderr)
             sys.exit(1)
@@ -397,11 +421,23 @@ if [ -d "${data_dir}/${train_set}" ] && "${require_cs}"; then
   esac
 fi
 
+check_wav_overlap() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    held_out = {line.rstrip("\n").split(maxsplit=1)[1] for line in f if line.strip()}
+with open(sys.argv[2], encoding="utf-8") as f:
+    for line in f:
+        if line.strip() and line.rstrip("\n").split(maxsplit=1)[1] in held_out:
+            raise SystemExit(f"recording overlap: {line.rstrip()}")
+PY
+}
+
 for d in valid_fleurs_lid test_fleurs_lid; do
   [ -f "${data_dir}/${d}/wav.scp" ] || continue
-  overlap=$(awk 'NR==FNR {w[$2]=1; next} $2 in w {print; exit}' \
-    "${data_dir}/${d}/wav.scp" "${data_dir}/train_fleurs_lid/wav.scp")
-  [ -z "${overlap}" ] || fail "FLEURS train/eval wav overlap with ${d}: ${overlap}"
+  check_wav_overlap "${data_dir}/${d}/wav.scp" "${data_dir}/train_fleurs_lid/wav.scp" \
+    || fail "FLEURS train/eval wav overlap with ${d}"
 done
 
 if [ -n "${train_set}" ] && [ -f "${data_dir}/${train_set}/wav.scp" ]; then
@@ -411,9 +447,8 @@ if [ -n "${train_set}" ] && [ -f "${data_dir}/${train_set}/wav.scp" ]; then
       *) continue ;;
     esac
     [ -f "${data_dir}/${name}/wav.scp" ] || continue
-    overlap=$(awk 'NR==FNR {w[$2]=1; next} $2 in w {print; exit}' \
-      "${data_dir}/${name}/wav.scp" "${data_dir}/${train_set}/wav.scp")
-    [ -z "${overlap}" ] || fail "${train_set}/${name} wav overlap: ${overlap}"
+    check_wav_overlap "${data_dir}/${name}/wav.scp" "${data_dir}/${train_set}/wav.scp" \
+      || fail "${train_set}/${name} wav overlap"
   done
 fi
 

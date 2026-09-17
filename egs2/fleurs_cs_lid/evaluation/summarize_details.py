@@ -34,7 +34,11 @@ def read_label_sets(path: Path) -> Dict[str, Tuple[str, ...]]:
     return values
 
 
-def read_correctness(path: Path, column: str | None) -> Dict[str, int]:
+def read_correctness(
+    path: Path,
+    column: str | None,
+    refs: Dict[str, Tuple[str, ...]] | None = None,
+) -> Dict[str, int]:
     values: Dict[str, int] = {}
     with path.open(encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -54,6 +58,12 @@ def read_correctness(path: Path, column: str | None) -> Dict[str, int]:
             utt = row[utt_column]
             if utt in values:
                 raise ValueError(f"duplicate utterance id in details: {utt}")
+            if refs is not None and (
+                "ref" not in row
+                or utt not in refs
+                or canonical_set(row["ref"].split()) != refs[utt]
+            ):
+                raise ValueError(f"reference/details label mismatch for {utt}")
             value = row[column].strip().lower()
             if value not in {"0", "1", "false", "true"}:
                 raise ValueError(f"non-binary correctness for {utt}: {value!r}")
@@ -80,7 +90,7 @@ def main() -> None:
 
     train = read_label_sets(args.train_utt2langs)
     refs = read_label_sets(args.ref_utt2langs)
-    correctness = read_correctness(args.details, args.correctness_column)
+    correctness = read_correctness(args.details, args.correctness_column, refs)
     if set(refs) != set(correctness):
         missing = sorted(set(refs) - set(correctness))
         extra = sorted(set(correctness) - set(refs))
@@ -95,6 +105,8 @@ def main() -> None:
         seen = labels in seen_sets
         add_stat(stats, "overall", "all", correct)
         add_stat(stats, "seen_status", "seen" if seen else "unseen", correct)
+        if len(labels) == 2:
+            add_stat(stats, "pair_seen_status", "seen" if seen else "unseen", correct)
         add_stat(stats, "language_set", "-".join(labels), correct)
 
     rows = []

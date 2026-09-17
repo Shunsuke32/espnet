@@ -1,1 +1,0 @@
-../../local/verify_lid_data.sh

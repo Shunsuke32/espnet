@@ -11,7 +11,7 @@ set -euo pipefail
 python=python3
 decode_dir=
 label_map=data/local/label_map.used.tsv
-test_sets="test_fleurs_lid test_cs_read_test test_cs_xtts_test1 test_cs_xtts_test2 test_cs_mms_test test_cs_all"
+test_sets="test_fleurs_lid test_cs_read_test test_cs_xtts_test1 test_cs_xtts_test2 test_cs_mms_test"
 
 . utils/parse_options.sh
 
@@ -101,3 +101,22 @@ done
 
 [ "${scored}" -gt 0 ] || missing=1
 [ "${missing}" -eq 0 ] || exit 1
+
+# Re-score the disjoint union instead of decoding the same CS audio twice.
+aggregate=true
+details=()
+for subset in test_cs_read_test test_cs_xtts_test1 test_cs_xtts_test2 test_cs_mms_test; do
+  case " ${test_sets} " in
+    *" ${subset} "*) details+=("${decode_dir}/${subset}/lidseq_details.tsv") ;;
+    *) aggregate=false ;;
+  esac
+done
+case " ${test_sets} " in *" test_cs_all "*) aggregate=false ;; esac
+if "${aggregate}"; then
+  "${python}" local/score_lidseq.py \
+    --ref data/test_cs_all/utt2langs \
+    --details_inputs "${details[@]}" \
+    --label_map "${label_map}" \
+    --out "${decode_dir}/test_cs_all/lidseq_score.json" \
+    --details_out "${decode_dir}/test_cs_all/lidseq_details.tsv"
+fi

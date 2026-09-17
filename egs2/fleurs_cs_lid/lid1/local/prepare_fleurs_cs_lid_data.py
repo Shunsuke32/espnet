@@ -23,14 +23,26 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import shutil
+import subprocess
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 LOGGER = logging.getLogger("prepare_fleurs_cs_lid_data")
+
+PAPER_FLEURS_REVISION = "70bb2e84b976b7e960aa89f1c648e09c59f894dd"
+PAPER_CS_FLEURS_REVISION = "0cdbf166c5517ae4b6eb1c54248522eedec53017"
+# Required immutable hash input for exact OLD utterance-ID reproduction. This
+# historical absolute path is an identifier namespace only: it is never opened
+# or required to exist. Changing/removing it changes IDs even for identical audio.
+OLD_FLEURS_AUDIO_NAMESPACE = (
+    "/home/mitsumori/espnet/egs2/fleurs_cs_lid/asr1/downloads/"
+    "fleurs/all_materialized/audio"
+)
 
 # Raw FLEURS config / lang_id names as exposed by HF FLEURS/XTREME-S.
 # These are NOT the training tokens by default.  We map them into one canonical
@@ -415,6 +427,7 @@ class Example:
     raw_label_parts: Tuple[str, ...] = ()
     duration_sec: Optional[float] = None
     num_samples: Optional[int] = None
+    metadata: dict = field(default_factory=dict)
 
 
 def sanitize_id(text: object) -> str:
@@ -543,6 +556,106 @@ def read_label_map(path: Optional[Path]) -> Dict[str, str]:
                 parts[1].lower(), parts[1].lower()
             )
     return mapping
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_provenance(args: argparse.Namespace) -> dict:
+    inputs = {}
+    source = None
+    if args.fleurs_tsv_root is not None and not args.skip_fleurs:
+        for name in ("train.tsv", "dev.tsv", "test.tsv"):
+            inputs[str(args.fleurs_tsv_root / name)] = sha256_file(
+                args.fleurs_tsv_root / name
+            )
+        source_path = args.fleurs_tsv_root / "source.json"
+        if source_path.exists():
+            source = json.loads(source_path.read_text(encoding="utf-8"))
+            if source.get("revision") != PAPER_FLEURS_REVISION:
+                raise ValueError(f"FLEURS revision mismatch: {source_path}")
+            if "tsv_sha256" in source:
+                for name in ("train.tsv", "dev.tsv", "test.tsv"):
+                    expected = source["tsv_sha256"].get(name)
+                    if expected != inputs[str(args.fleurs_tsv_root / name)]:
+                        raise ValueError(f"FLEURS TSV checksum mismatch: {name}")
+            else:
+                LOGGER.warning(
+                    "Legacy source.json has no TSV hashes; content is unverified"
+                )
+        else:
+            LOGGER.warning("Legacy TSVs have no source.json; revision is unverified")
+    if args.fleurs_manifest_root is not None and not args.skip_fleurs:
+        for split in ("train", "validation", "test"):
+            path = manifest_path(args.fleurs_manifest_root, split)
+            inputs[str(path)] = sha256_file(path)
+    cs_revision = None
+    if args.cs_root is not None:
+        metadata_paths = []
+        for subset in split_csv(args.cs_train_subsets) + split_csv(
+            args.cs_eval_subsets
+        ):
+            path = resolve_cs_subset_dir(args.cs_root, subset) / "metadata.jsonl"
+            inputs[str(path)] = sha256_file(path)
+            metadata_paths.append(str(path.relative_to(args.cs_root)))
+        if (args.cs_root / ".git").exists():
+            cs_revision = subprocess.check_output(
+                ["git", "-C", str(args.cs_root), "rev-parse", "HEAD"], text=True
+            ).strip()
+            if cs_revision != PAPER_CS_FLEURS_REVISION:
+                raise ValueError(f"CS-FLEURS revision mismatch: {cs_revision}")
+            dirty = subprocess.check_output(
+                [
+                    "git",
+                    "--no-optional-locks",
+                    "-C",
+                    str(args.cs_root),
+                    "status",
+                    "--porcelain",
+                    "--",
+                    *metadata_paths,
+                ],
+                text=True,
+            ).strip()
+            if dirty:
+                raise ValueError(
+                    f"CS-FLEURS metadata differs from pinned revision: {dirty}"
+                )
+    if args.label_map is not None:
+        inputs[str(args.label_map)] = sha256_file(args.label_map)
+    return {
+        "input_sha256": inputs,
+        "fleurs_source": source,
+        "fleurs_audio_root": str(args.fleurs_audio_root.resolve())
+        if args.fleurs_audio_root is not None
+        else None,
+        "cs_fleurs_revision": cs_revision,
+        "cs_split_mode": args.cs_split_mode,
+        "cs_dev_ratio": args.cs_dev_ratio,
+        "duration_bounds": {
+            key: getattr(args, key)
+            for key in (
+                "min_train_duration_sec",
+                "max_train_duration_sec",
+                "min_eval_duration_sec",
+                "max_eval_duration_sec",
+            )
+        },
+        "duration_policy": "Metadata seconds; inclusive minimum, exclusive maximum",
+        "iso3_aliases": ISO3_ALIASES,
+        "alpha2_to_iso3": ALPHA2_TO_ISO3,
+        "old_manifest_note": (
+            "OLD source train FLEURS has 268101 rows, historical formatted training "
+            "has 268100. fa_ir/31_13412724805436051564_4df8c99c467bba1a.wav "
+            "has metadata 16369 samples but formatted audio 15345 samples. "
+            "Source filtering is unchanged; downstream strict sample bounds differ."
+        ),
+    }
 
 
 def verify_fleurs_config_mapping(mapping: Dict[str, str]) -> None:
@@ -721,6 +834,7 @@ def write_data_dir(
             js_f.write(
                 json.dumps(
                     {
+                        **ex.metadata,
                         "uttid": ex.uttid,
                         "wav": ex.wav,
                         "labels": list(ex.labels),
@@ -738,6 +852,31 @@ def write_data_dir(
             )
     write_spk2utt(utt2spk, d / "spk2utt")
     write_lang2utt(examples, d / "lang2utt")
+    if examples and all(ex.duration_sec is not None for ex in examples):
+        with (
+            (d / "utt2dur").open("w", encoding="utf-8") as dur_f,
+            (d / "utt2num_samples").open("w", encoding="utf-8") as samples_f,
+        ):
+            for ex in examples:
+                # OLD raw_copy counts use the serialized metadata, not sf.info.
+                serialized = f"{ex.duration_sec:.6f}"
+                dur_f.write(f"{ex.uttid} {serialized}\n")
+                samples_f.write(f"{ex.uttid} {int(float(serialized) * 16000)}\n")
+        (d / "sample_count_policy.json").write_text(
+            json.dumps(
+                {
+                    "sample_rate": 16000,
+                    "policy": "OLD raw_copy: int(binary64(six-decimal utt2dur) * 16000)",
+                    "waveform_lengths": False,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    else:
+        for filename in ("utt2dur", "utt2num_samples", "sample_count_policy.json"):
+            (d / filename).unlink(missing_ok=True)
     LOGGER.info("wrote %s with %d utterances", d, len(examples))
 
 
@@ -772,7 +911,13 @@ def write_nlsyms(
     data_dirs: Dict[str, Sequence[Example]], token_format: str, nlsyms_txt: Path
 ) -> None:
     labels = sorted(
-        {lab for examples in data_dirs.values() for ex in examples for lab in ex.labels}
+        {
+            lab
+            for name, examples in data_dirs.items()
+            if name.startswith("train_")
+            for ex in examples
+            for lab in ex.labels
+        }
     )
     symbols = [target_symbol(label, token_format) for label in labels]
     validate_nlsyms(symbols)
@@ -830,11 +975,23 @@ def fleurs_uttid(raw_lang: object, rid: object, wav: object) -> str:
     speaker/id, not from a bare FLEURS sentence id.  That matters because ids
     such as 759 are reused across languages and can also appear in multiple
     recordings.  We follow the same principle: include raw language plus a
-    filepath-derived component.  The split is intentionally not part of the id,
-    so accidental train/dev/test audio overlap remains detectable by key.
+    filepath-derived component. Identical source paths and metadata IDs produce
+    the same key, so repeated references to a recording remain detectable.
+
+    Materialized paths are hashed in the immutable OLD namespace, not at their
+    current physical root. The original per-split suffix is retained exactly;
+    this does not identify duplicated content materialized under different names.
     """
     wav_s = str(wav)
     stem = sanitize_id(Path(wav_s).stem)
+    parts = Path(wav_s).parts
+    if (
+        len(parts) >= 3
+        and parts[-3] == str(raw_lang)
+        and parts[-2] in {"train", "validation", "test"}
+        and re.fullmatch(r".+_[0-9a-f]{16}", Path(wav_s).stem)
+    ):
+        wav_s = "/".join((OLD_FLEURS_AUDIO_NAMESPACE, *parts[-3:]))
     h = hashlib.sha1(wav_s.encode("utf-8")).hexdigest()[:12]
     return sanitize_id(f"fleurs_{raw_lang}_{rid}_{stem}_{h}")
 
@@ -904,6 +1061,7 @@ def load_fleurs_manifest_split(
                 (str(raw_lang),),
                 duration_sec,
                 num_samples,
+                {"source_metadata": row},
             )
         )
     LOGGER.info("loaded FLEURS manifest split=%s examples=%d", split, len(examples))
@@ -916,12 +1074,82 @@ def tsv_split_name(split: str) -> str:
     )
 
 
+def resolve_fleurs_tsv_audio(
+    wav: str,
+    tsv_root: Path,
+    raw_lang: str,
+    split: str,
+    audio_root: Optional[Path] = None,
+) -> str:
+    """Resolve physical audio independently of the original TSV's ID namespace.
+
+    Relative paths belong to the TSV directory. Explicit relocation accepts
+    only the materialized lang/split/filename suffix and never falls back to the
+    old file. Legacy absolute paths remain usable unless a local audio tree
+    makes the intended source ambiguous; that requires --fleurs_audio_root.
+    """
+    path = Path(wav)
+    if (
+        any(ord(char) < 32 or ord(char) == 127 for char in wav)
+        or ".." in path.parts
+        or "\\" in wav
+        or "://" in wav
+        or wav.rstrip().endswith("|")
+    ):
+        raise ValueError(f"unsafe FLEURS audio path: {wav!r}")
+    expected_split = "validation" if split == "dev" else split
+    suffix = None
+    if (
+        len(path.parts) >= 3
+        and path.parts[-3] == raw_lang
+        and path.parts[-2] == expected_split
+        and expected_split in {"train", "validation", "test"}
+        and re.fullmatch(r"[A-Za-z0-9_.-]+_[0-9a-f]{16}\.[A-Za-z0-9]+", path.name)
+    ):
+        suffix = Path(*path.parts[-3:])
+
+    if audio_root is not None:
+        if suffix is None:
+            raise ValueError(
+                "--fleurs_audio_root requires a matching materialized "
+                f"language/split/filename suffix: {wav} ({raw_lang}/{expected_split})"
+            )
+        base = audio_root.resolve(strict=True)
+        candidate = base / suffix
+    elif not path.is_absolute():
+        base = tsv_root.resolve(strict=True)
+        candidate = base / path
+    else:
+        local_audio = tsv_root / "audio"
+        if suffix is not None and (local_audio.exists() or local_audio.is_symlink()):
+            if (local_audio / suffix).resolve() != path.resolve():
+                raise ValueError(
+                    "ambiguous FLEURS audio roots; specify --fleurs_audio_root "
+                    f"instead of implicitly using {wav} with local tree {local_audio}"
+                )
+        return wav
+
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(base):
+        raise ValueError(f"FLEURS audio path escapes root {base}: {candidate}")
+    if any(ord(char) < 32 or ord(char) == 127 for char in str(resolved)):
+        raise ValueError(f"unsafe FLEURS audio root: {base}")
+    if not resolved.is_file() or not os.access(resolved, os.R_OK):
+        raise FileNotFoundError(
+            f"missing or unreadable relocated FLEURS audio: {candidate}"
+        )
+    if resolved.stat().st_size == 0:
+        raise ValueError(f"empty relocated FLEURS audio: {candidate}")
+    return str(resolved)
+
+
 def load_fleurs_tsv_split(
     root: Path,
     split: str,
     mapping: Dict[str, str],
     subsample_per_lang: int,
     strict_labels: bool,
+    audio_root: Optional[Path] = None,
 ) -> List[Example]:
     """Read the TSV layout produced by local/create_fleurs_lid_dataset.py.
 
@@ -959,6 +1187,9 @@ def load_fleurs_tsv_split(
                 raise ValueError(f"{tsv}: row has no path/filepath/file_name: {row}")
             rid = row.get("id") or row.get("client_id") or Path(str(wav)).stem
             uttid = fleurs_uttid(raw_lang, rid, wav)
+            wav = resolve_fleurs_tsv_audio(
+                str(wav), root, str(raw_lang), split, audio_root
+            )
             speaker = (
                 row.get("speaker")
                 or row.get("client_id")
@@ -977,6 +1208,7 @@ def load_fleurs_tsv_split(
                     (str(raw_lang),),
                     duration_sec,
                     num_samples,
+                    {"source_metadata": row},
                 )
             )
     LOGGER.info(
@@ -1010,6 +1242,7 @@ def load_fleurs_hf_split(
     ds = load_dataset(
         "google/fleurs",
         hf_config,
+        revision=PAPER_FLEURS_REVISION,
         split=split,
         streaming=subsample_per_lang > 0,
         cache_dir=cache_dir,
@@ -1068,6 +1301,7 @@ def load_fleurs(
     strict_labels: bool,
     manifest_root: Optional[Path],
     tsv_root: Optional[Path],
+    audio_root: Optional[Path] = None,
 ) -> List[Example]:
     if manifest_root is not None:
         return load_fleurs_manifest_split(
@@ -1075,7 +1309,7 @@ def load_fleurs(
         )
     if tsv_root is not None:
         return load_fleurs_tsv_split(
-            tsv_root, split, mapping, subsample_per_lang, strict_labels
+            tsv_root, split, mapping, subsample_per_lang, strict_labels, audio_root
         )
     if config in {"all", "fleurs.all"}:
         configs = list(OFFICIAL_FLEURS_CONFIGS)
@@ -1174,8 +1408,8 @@ def find_audio_path(cs_root: Path, subset_dir: Path, file_name: object) -> str:
     )
     for cand in candidates:
         if cand.exists():
-            return str(cand)
-    return str(candidates[0])
+            return str(cand.absolute())
+    return str(candidates[0].absolute())
 
 
 def load_cs_subset(
@@ -1228,6 +1462,7 @@ def load_cs_subset(
                 raw_label_parts=raw_parts,
                 duration_sec=duration_sec,
                 num_samples=num_samples,
+                metadata={"source_metadata": row},
             )
         )
     LOGGER.info("loaded CS-FLEURS subset=%s examples=%d", subset, len(examples))
@@ -1251,54 +1486,13 @@ def load_cs_subsets(
     return data
 
 
-def split_cs_train_valid_by_class(
-    cs_train_sets: Dict[str, List[Example]],
-    dev_ratio: float,
-) -> Tuple[List[Example], List[Example], List[Tuple[str, int, int, int]]]:
-    """Split CS-FLEURS train data within each canonical label class.
-
-    The old recipe used one global hash threshold, which yielded an approximate
-    source-level split but could leave individual language-pair classes with
-    very small or empty validation coverage.  Here each canonical label sequence
-    is split independently, e.g. ``ara eng`` gets its own 9:1 train/dev split.
-    """
-    flat: List[Example] = []
-    by_class: Dict[Tuple[str, ...], List[Example]] = defaultdict(list)
-    for _subset, exs in cs_train_sets.items():
-        for ex in exs:
-            flat.append(ex)
-            by_class[tuple(ex.labels)].append(ex)
-
-    valid_ids = set()
-    audit_rows: List[Tuple[str, int, int, int]] = []
-    for labels, exs in sorted(by_class.items(), key=lambda kv: kv[0]):
-        n_total = len(exs)
-        if dev_ratio <= 0.0 or n_total < 2:
-            n_valid = 0
-        else:
-            n_valid = int(round(n_total * dev_ratio))
-            n_valid = max(1, min(n_total - 1, n_valid))
-        ranked = sorted(exs, key=lambda ex: (stable_fraction(ex.uttid), ex.uttid))
-        valid_ids.update(ex.uttid for ex in ranked[:n_valid])
-        audit_rows.append((" ".join(labels), n_total, n_total - n_valid, n_valid))
-
-    train = [ex for ex in flat if ex.uttid not in valid_ids]
-    valid = [ex for ex in flat if ex.uttid in valid_ids]
-    LOGGER.info(
-        "split CS-FLEURS train subsets by canonical label class: train=%d valid=%d classes=%d dev_ratio=%.4f",
-        len(train),
-        len(valid),
-        len(audit_rows),
-        dev_ratio,
-    )
-    return train, valid, audit_rows
-
-
 def split_cs_train_valid_global_hash(
     cs_train_sets: Dict[str, List[Example]],
     dev_ratio: float,
 ) -> Tuple[List[Example], List[Example], List[Tuple[str, int, int, int]]]:
     """Reproduce the paper split using one deterministic hash threshold."""
+    if dev_ratio != 0.02:
+        raise ValueError("Only the OLD global_hash 0.02 split is supported")
     flat = [ex for examples in cs_train_sets.values() for ex in examples]
     valid_ids = {ex.uttid for ex in flat if stable_fraction(ex.uttid) < dev_ratio}
     train = [ex for ex in flat if ex.uttid not in valid_ids]
@@ -1365,6 +1559,7 @@ def to_pair_class_examples(examples: Sequence[Example]) -> List[Example]:
                 raw_label_parts=ex.raw_label_parts,
                 duration_sec=ex.duration_sec,
                 num_samples=ex.num_samples,
+                metadata=ex.metadata,
             )
         )
     return converted
@@ -1633,6 +1828,18 @@ def write_inventory(
     with (local / "label_map.used.tsv").open("w", encoding="utf-8") as f:
         for k, v in sorted(mapping.items()):
             f.write(f"{k}\t{v}\n")
+    (local / "training_classes.json").write_text(
+        json.dumps(
+            {
+                name: sorted({lab for ex in examples for lab in ex.labels})
+                for name, examples in sorted(data_dirs.items())
+                if name.startswith("train_")
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def split_csv(value: str) -> List[str]:
@@ -1682,6 +1889,13 @@ def get_parser() -> argparse.ArgumentParser:
         help="optional local JSONL manifests for tests/offline debug",
     )
     p.add_argument(
+        "--fleurs_audio_root",
+        type=Path,
+        default=None,
+        help="relocate TSV materialized audio to ROOT/<lang>/<split>/<filename>; "
+        "never fall back to the old path or rewrite source TSVs",
+    )
+    p.add_argument(
         "--fleurs_subsample_per_lang",
         type=int,
         default=0,
@@ -1701,9 +1915,9 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--cs_dev_ratio", type=float, default=0.02)
     p.add_argument(
         "--cs_split_mode",
-        choices=("global_hash", "classwise_hash"),
+        choices=("global_hash",),
         default="global_hash",
-        help="global_hash reproduces the paper split; classwise_hash improves per-class validation coverage",
+        help="OLD global hash 98:2 split only",
     )
     p.add_argument("--cs_pair_field", default="language")
     p.add_argument("--allow_single_cs", type=str2bool, default=False)
@@ -1780,11 +1994,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s: %(message)s",
     )
-    if not 0.0 <= args.cs_dev_ratio < 1.0:
-        raise ValueError("--cs_dev_ratio must be in [0, 1)")
+    if args.cs_dev_ratio != 0.02:
+        raise ValueError("Only the OLD global_hash 0.02 split is supported")
+    if args.fleurs_audio_root is not None and (
+        args.fleurs_tsv_root is None
+        or args.fleurs_manifest_root is not None
+        or args.skip_fleurs
+    ):
+        raise ValueError(
+            "--fleurs_audio_root requires an active --fleurs_tsv_root input"
+        )
     mapping = read_label_map(args.label_map)
     if args.verify_fleurs_config_mapping:
         verify_fleurs_config_mapping(mapping)
+    provenance = source_provenance(args)
     args.outdir.mkdir(parents=True, exist_ok=True)
     if args.nlsyms_txt is None:
         args.nlsyms_txt = args.outdir / "nlsyms.txt"
@@ -1802,6 +2025,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             args.strict_labels,
             args.fleurs_manifest_root,
             args.fleurs_tsv_root,
+            args.fleurs_audio_root,
         )
         fleurs_valid = load_fleurs(
             args.fleurs_config,
@@ -1812,6 +2036,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             args.strict_labels,
             args.fleurs_manifest_root,
             args.fleurs_tsv_root,
+            args.fleurs_audio_root,
         )
         fleurs_test = load_fleurs(
             args.fleurs_config,
@@ -1822,6 +2047,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             args.strict_labels,
             args.fleurs_manifest_root,
             args.fleurs_tsv_root,
+            args.fleurs_audio_root,
         )
         if args.exclude_fleurs_train_overlaps:
             fleurs_train, fleurs_overlap_removed = remove_fleurs_train_overlaps(
@@ -1843,14 +2069,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             args.strict_labels,
             args.allow_single_cs,
         )
-        if args.cs_split_mode == "global_hash":
-            cs_train, cs_valid, cs_split_audit_rows = split_cs_train_valid_global_hash(
-                cs_train_sets, args.cs_dev_ratio
-            )
-        else:
-            cs_train, cs_valid, cs_split_audit_rows = split_cs_train_valid_by_class(
-                cs_train_sets, args.cs_dev_ratio
-            )
+        cs_train, cs_valid, cs_split_audit_rows = split_cs_train_valid_global_hash(
+            cs_train_sets, args.cs_dev_ratio
+        )
         cs_eval_sets = load_cs_subsets(
             args.cs_root,
             split_csv(args.cs_eval_subsets),
@@ -1947,6 +2168,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     }
     write_nlsyms(sequence_dirs, args.token_format, args.nlsyms_txt)
     write_inventory(args.outdir, nonempty, mapping)
+    (args.outdir / "local" / "input_provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     write_label_audits(args.outdir, nonempty, mapping)
     write_cs_split_audit(args.outdir, cs_split_audit_rows, args.cs_split_mode)
     write_duration_audit(args.outdir, raw_data_dirs, nonempty, duration_removed)

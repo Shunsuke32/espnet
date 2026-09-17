@@ -67,3 +67,24 @@ def test_lid_target_preprocessor_rejects_duplicate_labels(lang2utt, preprocessor
     )
     with pytest.raises(ValueError, match="duplicate"):
         preprocessor._text_process({"lid_labels": "eng eng"})
+
+
+@pytest.mark.parametrize(
+    "preprocessor_class", [LIDSoftLabelPreprocessor, LIDMultiLabelPreprocessor]
+)
+@pytest.mark.parametrize(
+    "raw,error",
+    [("", ValueError), ("ara eng jpn", ValueError), ("missing", KeyError)],
+)
+def test_lid_target_preprocessor_rejects_invalid_labels(
+    lang2utt, preprocessor_class, raw, error
+):
+    preprocessor = preprocessor_class(
+        train=False,
+        lang2utt=str(lang2utt),
+        fix_duration=False,
+        noise_apply_prob=0.0,
+        rir_apply_prob=0.0,
+    )
+    with pytest.raises(error):
+        preprocessor._text_process({"lid_labels": raw})

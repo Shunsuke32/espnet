@@ -66,21 +66,54 @@ class ESPnetASRModel(AbsESPnetModel):
         autocast_frontend: bool = False,
         extract_feats_in_collect_stats: bool = True,
         lang_token_id: int = -1,
-        lidseq_order_insensitive_loss: bool = False,
-        lidseq_order_insensitive_reduction: str = "min",
+        lidseq_order_insensitive_loss: Optional[bool] = None,
+        lidseq_order_insensitive_reduction: Optional[str] = None,
+        pit_loss: Optional[bool] = None,
+        pit_loss_reduction: Optional[str] = None,
     ):
         assert 0.0 <= ctc_weight <= 1.0, ctc_weight
         assert 0.0 <= interctc_weight < 1.0, interctc_weight
-        if lidseq_order_insensitive_loss:
+        # None distinguishes omitted aliases from explicitly conflicting values.
+        if lidseq_order_insensitive_loss is not None:
+            logging.warning(
+                "lidseq_order_insensitive_loss is deprecated; use pit_loss instead."
+            )
+            if pit_loss is not None and pit_loss != lidseq_order_insensitive_loss:
+                raise ValueError(
+                    f"Conflicting pit_loss={pit_loss!r} and "
+                    "lidseq_order_insensitive_loss="
+                    f"{lidseq_order_insensitive_loss!r}"
+                )
+            pit_loss = lidseq_order_insensitive_loss
+        if pit_loss is None:
+            pit_loss = False
+        if lidseq_order_insensitive_reduction is not None:
+            logging.warning(
+                "lidseq_order_insensitive_reduction is deprecated; "
+                "use pit_loss_reduction instead."
+            )
+            if (
+                pit_loss_reduction is not None
+                and pit_loss_reduction != lidseq_order_insensitive_reduction
+            ):
+                raise ValueError(
+                    f"Conflicting pit_loss_reduction={pit_loss_reduction!r} and "
+                    "lidseq_order_insensitive_reduction="
+                    f"{lidseq_order_insensitive_reduction!r}"
+                )
+            pit_loss_reduction = lidseq_order_insensitive_reduction
+        if pit_loss_reduction is None:
+            pit_loss_reduction = "min"
+        if pit_loss:
             if ctc_weight != 0.0:
                 raise ValueError(
-                    "lidseq_order_insensitive_loss currently supports attention-only "
+                    "pit_loss currently supports attention-only "
                     f"LID sequence training, but ctc_weight={ctc_weight}"
                 )
-            if lidseq_order_insensitive_reduction != "min":
+            if pit_loss_reduction != "min":
                 raise ValueError(
-                    "Unsupported lidseq_order_insensitive_reduction="
-                    f"{lidseq_order_insensitive_reduction!r}; supported: 'min'"
+                    "Unsupported pit_loss_reduction="
+                    f"{pit_loss_reduction!r}; supported: 'min'"
                 )
 
         super().__init__()
@@ -104,8 +137,10 @@ class ESPnetASRModel(AbsESPnetModel):
         self.interctc_weight = interctc_weight
         self.aux_ctc = aux_ctc
         self.token_list = token_list.copy()
-        self.lidseq_order_insensitive_loss = lidseq_order_insensitive_loss
-        self.lidseq_order_insensitive_reduction = lidseq_order_insensitive_reduction
+        self.pit_loss = pit_loss
+        self.pit_loss_reduction = pit_loss_reduction
+        self.lidseq_order_insensitive_loss = pit_loss
+        self.lidseq_order_insensitive_reduction = pit_loss_reduction
 
         self.frontend = frontend
         self.specaug = specaug
@@ -201,10 +236,10 @@ class ESPnetASRModel(AbsESPnetModel):
                     token_list, sym_space, sym_blank, report_cer, report_wer
                 )
 
-            if self.lidseq_order_insensitive_loss:
+            if self.pit_loss:
                 logging.info(
-                    "Enabled order-insensitive LID sequence attention loss "
-                    f"(reduction={self.lidseq_order_insensitive_reduction})"
+                    "Enabled PIT attention loss for 1- or 2-token LID sequences "
+                    f"(reduction={self.pit_loss_reduction})"
                 )
 
         if ctc_weight == 0.0:
@@ -580,9 +615,9 @@ class ESPnetASRModel(AbsESPnetModel):
         ys_pad_lens: torch.Tensor,
     ):
         if hasattr(self, "lang_token_id") and self.lang_token_id is not None:
-            if self.lidseq_order_insensitive_loss:
+            if self.pit_loss:
                 raise RuntimeError(
-                    "lidseq_order_insensitive_loss does not support lang_token_id "
+                    "pit_loss does not support lang_token_id "
                     "prefixing because it would make the LID permutation target "
                     "ambiguous."
                 )
@@ -604,7 +639,7 @@ class ESPnetASRModel(AbsESPnetModel):
         )
 
         # 2. Compute attention loss
-        if self.lidseq_order_insensitive_loss:
+        if self.pit_loss:
             loss_att = self._calc_order_insensitive_lidseq_att_loss(
                 encoder_out,
                 encoder_out_lens,
@@ -677,7 +712,7 @@ class ESPnetASRModel(AbsESPnetModel):
     ) -> torch.Tensor:
         if int(ys_pad_lens.max()) > 2:
             raise RuntimeError(
-                "lidseq_order_insensitive_loss only supports 1- or 2-token "
+                "pit_loss only supports 1- or 2-token "
                 f"LID sequence targets, but got max length {int(ys_pad_lens.max())}"
             )
 

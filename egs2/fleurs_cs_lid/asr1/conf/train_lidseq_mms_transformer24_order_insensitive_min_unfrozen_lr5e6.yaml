@@ -34,8 +34,8 @@ model_conf:
   ctc_weight: 0.0
   lsm_weight: 0.1
   length_normalized_loss: false
-  lidseq_order_insensitive_loss: true
-  lidseq_order_insensitive_reduction: min
+  pit_loss: true
+  pit_loss_reduction: min
 freeze_param: []
 num_att_plot: 0
 num_workers: 4
@@ -54,7 +54,7 @@ best_model_criterion:
   - loss
   - min
 max_epoch: 30
-num_iters_per_epoch: 640
+num_iters_per_epoch: 3880
 batch_type: sorted
 accum_grad: 4
 optim: adam
@@ -65,10 +65,11 @@ optim_conf:
   - 0.98
 scheduler: warmuplr
 scheduler_conf:
-  warmup_steps: 960
+  warmup_steps: 2910
 batch_size: 8
 valid_batch_size: 8
 drop_last_iter: true
 sort_in_batch: descending
 sort_batch: descending
-# Paper second-phase config. Initialize it from the frozen best checkpoint.
+# FLEURS+CS-FLEURS second phase. Explicitly choose the frozen initialization
+# checkpoint; neither epoch 9 nor a best-checkpoint alias is selected here.

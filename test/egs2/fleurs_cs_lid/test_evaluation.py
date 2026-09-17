@@ -19,10 +19,10 @@ def load_module(name, path):
     return module
 
 
-def test_lid2_saved_scores_are_pickle_free_and_order_insensitive(tmp_path):
+def test_saved_scores_are_pickle_free_and_order_insensitive(tmp_path):
     scorer = load_module(
-        "lid2_saved_scorer",
-        RECIPE / "lid2" / "local" / "score_lid2_logits_threshold_sweep.py",
+        "lid_common_saved_scorer",
+        RECIPE / "evaluation" / "lid_metrics.py",
     )
     labels = ["ara", "eng", "jpn"]
     utt_ids = ["single", "pair"]
@@ -36,29 +36,22 @@ def test_lid2_saved_scores_are_pickle_free_and_order_insensitive(tmp_path):
     )
     refs = tmp_path / "utt2langs"
     refs.write_text("single eng\npair eng ara\n", encoding="utf-8")
-    prefix = tmp_path / "scores"
-    old_argv = sys.argv
-    try:
-        sys.argv = [
-            "score_lid2",
-            "--logits_npz",
-            str(archive),
-            "--ref_utt2langs",
-            str(refs),
-            "--output_prefix",
-            str(prefix),
-        ]
-        scorer.main()
-    finally:
-        sys.argv = old_argv
-
-    derived = np.load(
-        prefix.with_suffix(".logits_and_softmax_probs.npz"), allow_pickle=False
-    )
-    assert derived["utt_ids"].tolist() == utt_ids
-    with prefix.with_suffix(".cardinality_matched_topk.details.tsv").open(
-        encoding="utf-8"
-    ) as f:
+    with np.load(archive, allow_pickle=False) as saved:
+        assert saved["utt_ids"].tolist() == utt_ids
+        scorer.evaluate_set(
+            tmp_path,
+            "scores",
+            saved["labels"].tolist(),
+            saved["utt_ids"].tolist(),
+            saved["logits"],
+            scorer.probabilities(saved["logits"], "softmax"),
+            scorer.read_refs(refs)[0],
+            set(),
+            dict(prediction_mode="individual_topk", activation="softmax", sweep=True),
+            [0.0, 0.3, 1.0],
+            [0.0, 30.0],
+        )
+    with (tmp_path / "scores.details.tsv").open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f, delimiter="\t"))
     assert [row["exact"] for row in rows] == ["1", "1"]
 
@@ -121,7 +114,21 @@ def test_paired_significance_and_seen_summary(tmp_path):
         check=True,
     )
     rows = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))["rows"]
-    seen = next(row for row in rows if row["group"] == "seen")
-    unseen = next(row for row in rows if row["group"] == "unseen")
+    seen = next(
+        row
+        for row in rows
+        if row["group_type"] == "seen_status" and row["group"] == "seen"
+    )
+    unseen = next(
+        row
+        for row in rows
+        if row["group_type"] == "seen_status" and row["group"] == "unseen"
+    )
     assert seen["n"] == 2 and seen["correct"] == 2
     assert unseen["n"] == 1 and unseen["correct"] == 0
+    seen_pair = next(
+        row
+        for row in rows
+        if row["group_type"] == "pair_seen_status" and row["group"] == "seen"
+    )
+    assert seen_pair["n"] == 1 and seen_pair["correct"] == 1

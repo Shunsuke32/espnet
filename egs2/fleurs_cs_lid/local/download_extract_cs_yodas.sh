@@ -24,6 +24,11 @@ else
   exit 2
 fi
 
+if [ "${revision}" != e51028041b403f63c99ac91a4af040e72d0cad0e ]; then
+  echo "Error: only the pinned OLD CS-YODAS revision is supported" >&2
+  exit 1
+fi
+
 metadata_dir=${metadata_dir:-${root}/metadata}
 audio_root=${audio_root:-${root}/audio}
 archive_dir=${root}/archives
@@ -53,21 +58,8 @@ for lang in "${langs[@]}"; do
   fi
 done
 
-declare -A metadata_sha256=(
-  [ara]=19254013052100a5c780d2342c21185babee874cec6a7cb5f14c67bae1435abb
-  [cmn]=6cdad8b713ea41a598077dd0fedae14824eb2d6998970132d5b2c885201c7697
-  [fra]=76f415663519b4898ddd0540bbf7b5149aae25f181e9262a39e89aae843fbfda
-  [hin]=2533311b72283f436ec9a0aca687b8f66983bd2c1fdd2574704a3091cba3e526
-  [jpn]=c5fca5676a09f07391aee943996ce6619529bea273b17237f756f1e66c7a5844
-  [rus]=f29381d741c611e54e5ad06d7645f4a9fa837508ea8784006d4f600d70be006a
-)
-for lang in "${langs[@]}"; do
-  actual=$(sha256sum "${metadata_dir}/${lang}.jsonl" | awk '{print $1}')
-  if [ "${actual}" != "${metadata_sha256[${lang}]}" ]; then
-    echo "Error: metadata checksum mismatch for ${lang}.jsonl at revision ${revision}" >&2
-    exit 1
-  fi
-done
+python3 "${script_dir}/prepare_cs_yodas_views.py" \
+  --metadata_dir "${metadata_dir}" --audio_root "${audio_root}" --verify_metadata_only
 
 if "${download_archives}"; then
   for name in ara.tar cmn.tar hin.tar jpn.tar rus.tar fra.tar.aa fra.tar.ab; do
@@ -112,7 +104,7 @@ if "${extract_audio}"; then
     if "${extract_missing_only}"; then
       while IFS= read -r wav_path; do
         [ -n "${wav_path}" ] || continue
-        [ -f "${audio_root}/${wav_path}" ] || echo "${wav_path}"
+        [ -s "${audio_root}/${wav_path}" ] || echo "${wav_path}"
       done < "${selected_dir}/${lang}.paths" > "${selected_dir}/${lang}.missing.paths"
     else
       cp "${selected_dir}/${lang}.paths" "${selected_dir}/${lang}.missing.paths"

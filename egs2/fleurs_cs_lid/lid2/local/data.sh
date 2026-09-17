@@ -1,1 +1,0 @@
-../../lid1/local/data.sh

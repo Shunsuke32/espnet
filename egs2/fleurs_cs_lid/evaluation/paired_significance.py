@@ -53,7 +53,11 @@ def read_details(
                 raise ValueError(f"duplicate utterance id in {path}: {utt}")
             scores[utt] = parse_bool(row[column])
             if "ref" in row:
-                refs[utt] = row["ref"]
+                labels = row["ref"].split()
+                # Set metrics must align across ASR and classifier token orders.
+                if column != "seq_exact":
+                    labels = sorted(labels)
+                refs[utt] = " ".join(labels)
     return scores, refs
 
 

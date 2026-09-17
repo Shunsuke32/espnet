@@ -10,6 +10,11 @@ ESPnet/Kaldi data directories for:
 
 CS-YODAS train/valid examples can be duration-capped independently from the
 already-prepared FLEURS/CS-FLEURS manifests.
+
+utt2num_samples is historical 16-kHz raw_copy metadata, not waveform length:
+truncate the binary64 value of the six-decimal utt2dur times 16000. In particular,
+the Persian fa_ir/train/31_13412724805436051564_4df8c99c467bba1a.wav remains in
+OLD dur70 with 16368 metadata samples, despite its 15345-sample waveform.
 """
 
 from __future__ import annotations
@@ -26,6 +31,28 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 LOGGER = logging.getLogger("prepare_cs_yodas_views")
+
+PAPER_REVISION = "e51028041b403f63c99ac91a4af040e72d0cad0e"
+METADATA_SHA256 = {
+    "ara": "19254013052100a5c780d2342c21185babee874cec6a7cb5f14c67bae1435abb",
+    "cmn": "6cdad8b713ea41a598077dd0fedae14824eb2d6998970132d5b2c885201c7697",
+    "fra": "76f415663519b4898ddd0540bbf7b5149aae25f181e9262a39e89aae843fbfda",
+    "hin": "2533311b72283f436ec9a0aca687b8f66983bd2c1fdd2574704a3091cba3e526",
+    "jpn": "c5fca5676a09f07391aee943996ce6619529bea273b17237f756f1e66c7a5844",
+    "rus": "f29381d741c611e54e5ad06d7645f4a9fa837508ea8784006d4f600d70be006a",
+}
+
+
+def verify_metadata(metadata_dir: Path) -> None:
+    for lang, expected in METADATA_SHA256.items():
+        path = metadata_dir / f"{lang}.jsonl"
+        digest = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected:
+            raise ValueError(f"CS-YODAS metadata checksum mismatch: {path}")
+
 
 LANG_CONFIGS = ("ara", "cmn", "fra", "hin", "jpn", "rus")
 BASE_ENGLISH_NAMES = {
@@ -99,6 +126,8 @@ def read_kv(path: Path) -> Dict[str, str]:
             if not line:
                 continue
             key, value = line.split(maxsplit=1)
+            if key in data:
+                raise ValueError(f"duplicate utterance ID in {path}: {key}")
             data[key] = value
     return data
 
@@ -112,6 +141,8 @@ def read_labels_jsonl(path: Path) -> Dict[str, Mapping[str, object]]:
             if not line.strip():
                 continue
             obj = json.loads(line)
+            if str(obj["uttid"]) in data:
+                raise ValueError(f"duplicate utterance ID in {path}: {obj['uttid']}")
             data[str(obj["uttid"])] = obj
     return data
 
@@ -135,7 +166,7 @@ def read_existing_data_dir(data_dir: Path) -> List[Example]:
                 uttid=uttid,
                 wav=wavs[uttid],
                 labels=labels,
-                speaker=utt2spk.get(uttid, uttid),
+                speaker=str(m.get("speaker") or utt2spk.get(uttid, uttid)),
                 source=str(utt2category.get(uttid) or m.get("source") or "existing"),
                 subset=str(m.get("subset") or data_dir.name),
                 raw_label_value=str(m.get("raw_label_value") or " ".join(labels)),
@@ -198,7 +229,7 @@ def load_yodas_records(metadata_dir: Path, audio_root: Path) -> List[Example]:
                 )
                 asr_start, asr_end = parse_asr_offsets(obj["id"])
                 uttid = f"csyodas_{config}_{sanitize_id(obj['id'])}"
-                wav = str(audio_root / obj["wav_path"])
+                wav = str((audio_root / obj["wav_path"]).absolute())
                 metadata = {
                     "cs_yodas_id": obj["id"],
                     "config": config,
@@ -243,6 +274,8 @@ def split_yodas(
     valid_ratio: float,
     seed: str,
 ) -> Dict[str, List[Example]]:
+    if len({ex.uttid for ex in examples}) != len(examples):
+        raise ValueError("duplicate CS-YODAS utterance IDs")
     by_lang: Dict[str, Dict[str, List[Example]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -352,11 +385,30 @@ def write_data_dir(name: str, examples: Sequence[Example], outdir: Path) -> None
             }
             js_f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     if write_utt2dur:
-        with (d / "utt2dur").open("w", encoding="utf-8") as dur_f:
+        with (
+            (d / "utt2dur").open("w", encoding="utf-8") as dur_f,
+            (d / "utt2num_samples").open("w", encoding="utf-8") as samples_f,
+        ):
             for ex in examples:
-                dur_f.write(f"{ex.uttid} {ex.duration_sec:.6f}\n")
+                serialized = f"{ex.duration_sec:.6f}"
+                dur_f.write(f"{ex.uttid} {serialized}\n")
+                samples_f.write(f"{ex.uttid} {int(float(serialized) * 16000)}\n")
+        (d / "sample_count_policy.json").write_text(
+            json.dumps(
+                {
+                    "sample_rate": 16000,
+                    "policy": "OLD raw_copy: int(binary64(six-decimal utt2dur) * 16000)",
+                    "waveform_lengths": False,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     else:
         (d / "utt2dur").unlink(missing_ok=True)
+        (d / "utt2num_samples").unlink(missing_ok=True)
+        (d / "sample_count_policy.json").unlink(missing_ok=True)
     write_spk2utt(utt2spk, d / "spk2utt")
     write_lang2utt(examples, d / "lang2utt")
     LOGGER.info(
@@ -452,6 +504,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--outdir", type=Path, default=Path("lid1/data"))
     p.add_argument("--metadata_dir", type=Path, required=True)
     p.add_argument("--audio_root", type=Path, required=True)
+    p.add_argument("--verify_metadata_only", action="store_true")
     p.add_argument("--train_ratio", type=float, default=0.8)
     p.add_argument("--valid_ratio", type=float, default=0.1)
     p.add_argument("--seed", default="cs-yodas-v1")
@@ -464,6 +517,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
+    verify_metadata(args.metadata_dir)
+    if args.verify_metadata_only:
+        return
     src = args.source_data_dir
     outdir = args.outdir
 
@@ -529,6 +585,25 @@ def main() -> None:
         write_data_dir(name, examples, outdir)
         write_inventory(name, examples, outdir)
         names.append(name)
+
+    provenance = {
+        "revision": PAPER_REVISION,
+        "metadata_sha256": METADATA_SHA256,
+        "seed": args.seed,
+        "train_ratio": args.train_ratio,
+        "valid_ratio": args.valid_ratio,
+        "max_yodas_train_valid_duration": args.max_yodas_train_valid_duration,
+        "duration_policy": "Context milliseconds / 1000; strict maximum; test uncapped",
+        "sample_count_policy": "OLD 16k raw_copy: int(binary64(six-decimal utt2dur) * 16000); not audio length",
+        "training_classes": {
+            name: sorted({lab for ex in examples for lab in ex.labels})
+            for name, examples in specs.items()
+            if name.startswith(f"{args.prefix}train_")
+        },
+    }
+    (outdir / "local" / f"{args.prefix}cs_yodas_input_provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
     write_dropped(
         outdir / "local" / f"{args.prefix}cs_yodas_dropped_train_duration.tsv",

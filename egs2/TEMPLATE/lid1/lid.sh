@@ -68,6 +68,7 @@ min_wav_duration=1.0  # Minimum duration in second.
 max_wav_duration=60.  # Maximum duration in second.
 
 # Language identification model related
+lid_stats_dir=        # Specify the directory path for LID statistics.
 lid_exp=              # Specify the directory path for lid experiment.
 lid_tag=              # Suffix to the result dir for lid model training.
 lid_config=           # Config for the lid model training.
@@ -132,6 +133,7 @@ Options:
     max_wav_duration=60.  # Maximum duration in second.
 
     # Language identification model related
+    lid_stats_dir=        # Statistics directory (default: ${expdir}/lid_stats_${fs}).
     lid_exp=              # Specify the directory path for lid experiment.
     lid_tag=              # Suffix to the result dir for lid model training.
     lid_config=           # Config for the lid model training.
@@ -205,7 +207,9 @@ if [ -z "${lid_tag}" ]; then
 fi
 
 # Set directory used for training commands
-lid_stats_dir="${expdir}/lid_stats_${fs}"
+if [ -z "${lid_stats_dir}" ]; then
+    lid_stats_dir="${expdir}/lid_stats_${fs}"
+fi
 if [ -z "${lid_exp}" ]; then
     lid_exp="${expdir}/lid_${lid_tag}"
 fi

@@ -32,7 +32,6 @@ from espnet2.spk.loss.aamsoftmax_subcenter_intertopk import (
     ArcMarginProduct_intertopk_subcenter_softtarget,
 )
 from espnet2.spk.loss.abs_loss import AbsLoss
-from espnet2.spk.loss.multilabel_bce import MultiLabelBCE
 from espnet2.spk.loss.softmax import Softmax
 from espnet2.spk.pooling.abs_pooling import AbsPooling
 from espnet2.spk.pooling.chn_attn_stat_pooling import ChnAttnStatPooling
@@ -194,7 +193,6 @@ loss_choices = ClassChoices(
             ArcMarginProduct_intertopk_subcenter_multilabel_bce
         ),
         aamsoftmax_sc_topk_softtarget=ArcMarginProduct_intertopk_subcenter_softtarget,
-        multilabel_bce=MultiLabelBCE,
         softmax=Softmax,
     ),
     type_check=AbsLoss,

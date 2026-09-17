@@ -264,7 +264,7 @@ def logits_from_model(
         k = logits.shape[1] // num_labels
         logits = logits.reshape(logits.shape[0], num_labels, k).max(dim=2).values
 
-    # Scaling does not change top-k, but gives calibrated-looking posteriors.
+    # Match the training-time cosine scale; this does not change top-k ranking.
     if apply_loss_scale:
         scale = getattr(model.loss, "scale", getattr(model.loss, "s", None))
         if scale is not None:

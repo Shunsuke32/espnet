@@ -25,7 +25,7 @@ gpu_inference=true
 num_nodes=1
 stage=1
 stop_stage=13
-feats_type=raw
+feats_type=
 fs=16k
 audio_format=wav
 # local/data.sh applies the source-specific duration policy first. The ASR
@@ -41,7 +41,9 @@ train_set=
 valid_set=
 test_sets=
 
-asr_config=conf/train_lidseq_mms_transformer24.yaml
+training_phase=frozen
+resume=false
+asr_config=
 inference_config=conf/decode_lidseq_mms_transformer.yaml
 asr_tag=
 inference_tag=lidseq_mms_transformer24_beam5
@@ -56,13 +58,13 @@ inference_args=
 auto_training_budget=true
 enforce_training_policy=true
 require_cuda_visible_devices=true
-train_batch_size=8
+train_batch_size=
 batch_size=   # alias: --batch_size 32/16/8/4 may be used instead of --train_batch_size
-accum_grad=4
+accum_grad=
 effective_batch_size=32
-target_passes=3.0
-budget_max_epoch=30
-warmup_ratio=0.1
+target_passes=
+budget_max_epoch=
+warmup_ratio=
 round_updates_per_epoch_to=10
 fixed_batch_type=sorted
 drop_last_iter=true
@@ -77,12 +79,13 @@ score_label_map=data/local/label_map.used.tsv
 fleurs_config=all
 fleurs_download_dir=${FLEURS:-downloads/fleurs}
 fleurs_tsv_root=
+fleurs_audio_root=
 fleurs_cache_dir=downloads/cache
 fleurs_revision=70bb2e84b976b7e960aa89f1c648e09c59f894dd
 fleurs_manifest_root=
 fleurs_subsample_per_lang=0
 skip_fleurs=false
-skip_fleurs_download=false
+skip_fleurs_download=true
 cs_root=${CS_FLEURS_ROOT:-}
 cs_train_subsets="xtts/train"
 cs_eval_subsets="read/test,xtts/test1,xtts/test2,mms/test"
@@ -109,9 +112,136 @@ min_eval_duration_sec=-1.0
 max_eval_duration_sec=0.0
 duration_missing_policy=error
 
-default_asr_config=${asr_config}
-
 . utils/parse_options.sh
+
+case "${training_phase}" in
+  frozen|unfrozen) ;;
+  *) echo "Error: --training_phase must be frozen or unfrozen" >&2; exit 2 ;;
+esac
+case "${resume}" in
+  true|false) ;;
+  *) echo "Error: --resume must be true or false" >&2; exit 2 ;;
+esac
+
+config_stem=conf/train_lidseq_mms_transformer24_order_insensitive_min
+default_batch=8
+default_accum=4
+default_epochs=30
+default_passes=3
+default_warmup=0.1
+case "${train_mode}" in
+  csall|cs_all|cs-all)
+    config_stem+=_csall
+    default_batch=4
+    default_accum=8
+    [ -n "${feats_type}" ] || feats_type=raw_copy
+    ;;
+  mixed)
+    if [ "${training_phase}" = frozen ]; then
+      default_epochs=10
+      default_passes=1
+      default_warmup=0.3
+    fi
+    ;;
+esac
+[ -n "${feats_type}" ] || feats_type=raw
+if [ "${training_phase}" = unfrozen ]; then
+  config_stem+=_unfrozen_lr5e6
+fi
+[ -n "${asr_config}" ] || asr_config=${config_stem}.yaml
+[ -n "${train_batch_size}" ] || train_batch_size=${default_batch}
+[ -n "${accum_grad}" ] || accum_grad=${default_accum}
+[ -n "${target_passes}" ] || target_passes=${default_passes}
+[ -n "${budget_max_epoch}" ] || budget_max_epoch=${default_epochs}
+[ -n "${warmup_ratio}" ] || warmup_ratio=${default_warmup}
+
+validate_phase_config() {
+  local compare_saved=${1:-false}
+  "${enforce_training_policy}" || return 0
+  [ "${stage}" -le 11 ] && [ "${stop_stage}" -ge 11 ] || return 0
+  python3 - "${asr_config}" "${training_phase}" "${compare_saved}" "exp/asr_${asr_tag}/config.yaml" <<'PY'
+import sys
+import yaml
+
+path, phase, compare_saved, saved_path = sys.argv[1:]
+with open(path) as stream:
+    config = yaml.safe_load(stream)
+expected = ["frontend.upstream"] if phase == "frozen" else []
+if (config.get("freeze_param") or []) != expected:
+    raise SystemExit(f"Error: {path}: freeze_param does not match --training_phase {phase}")
+if config.get("init_param"):
+    raise SystemExit("Error: init_param in YAML is not allowed; choose --pretrained_model explicitly")
+def canonical_model_conf(model):
+    model = dict(model or {})
+    for current, legacy, default in (
+        ("pit_loss", "lidseq_order_insensitive_loss", False),
+        ("pit_loss_reduction", "lidseq_order_insensitive_reduction", "min"),
+    ):
+        old = model.pop(legacy, None)
+        new = model.get(current)
+        if old is not None and new is not None and old != new:
+            raise SystemExit(f"Error: conflicting {current} and {legacy}")
+        model[current] = new if new is not None else (old if old is not None else default)
+    return model
+
+model = canonical_model_conf(config.get("model_conf"))
+config["model_conf"] = model
+if model["pit_loss"] is not True or model["pit_loss_reduction"] != "min":
+    raise SystemExit("Error: this recipe selects the unordered minimum-permutation loss")
+if compare_saved == "true":
+    import inspect
+    from pathlib import Path
+
+    # Follow the recipe's canonical helper into this checkout, not installed ESPnet.
+    helper = Path("local/make_fixed_batch_config.py").resolve(strict=True)
+    roots = [root for root in helper.parents if (root / "espnet2/asr/espnet_model.py").is_file()]
+    if not roots:
+        raise SystemExit("Error: cannot locate this recipe's ESPnetASRModel")
+    root = roots[0]
+    sys.path.insert(0, str(root))
+    from espnet2.asr.espnet_model import ESPnetASRModel
+
+    if Path(inspect.getfile(ESPnetASRModel)).resolve() != root / "espnet2/asr/espnet_model.py":
+        raise SystemExit("Error: resume validation imported ESPnetASRModel from another checkout")
+    # Inspect only: no model/frontend construction or checkpoint loading.
+    defaults = canonical_model_conf({
+        name: parameter.default
+        for name, parameter in inspect.signature(ESPnetASRModel.__init__).parameters.items()
+        if parameter.default is not inspect.Parameter.empty
+    })
+
+    def complete_model_conf(model):
+        model = canonical_model_conf(model)
+        unknown = model.keys() - defaults.keys()
+        if unknown:
+            raise SystemExit(f"Error: unknown model_conf fields: {', '.join(sorted(unknown))}")
+        return {**defaults, **model}
+
+    with open(saved_path) as stream:
+        saved = yaml.safe_load(stream)
+    config["model_conf"] = complete_model_conf(config.get("model_conf"))
+    saved["model_conf"] = complete_model_conf(saved.get("model_conf"))
+    if (saved.get("freeze_param") or []) != expected:
+        raise SystemExit("Error: resume config differs from this phase's saved freeze_param")
+    # Saved configs include extra runtime defaults, so compare the requested keys.
+    for key, value in config.items():
+        if key in saved and saved[key] != value:
+            raise SystemExit(f"Error: resume config differs from this phase's saved {key}")
+PY
+}
+
+if [ "${ngpu}" -eq 0 ]; then
+  gpu_inference=false
+fi
+
+if [ "${feats_type}" = raw_copy ]; then
+  case "${audio_format}" in
+    *ark*)
+      echo "Error: raw_copy requires existing sound files, not an archive format." >&2
+      exit 2
+      ;;
+  esac
+fi
 
 needs_training_or_eval_gpu() {
   [ "${ngpu}" -gt 0 ] && [ "${stage}" -le 13 ] && [ "${stop_stage}" -ge 10 ]
@@ -133,6 +263,7 @@ check_no_protected_args() {
 
 validate_training_policy() {
   "${enforce_training_policy}" || return 0
+  [ "${stage}" -le 11 ] && [ "${stop_stage}" -ge 11 ] || return 0
   needs_training_or_eval_gpu || return 0
   "${auto_training_budget}" || {
     echo "Error: production training/eval requires --auto_training_budget true. Use --enforce_training_policy false only for explicit debug runs." >&2
@@ -236,7 +367,7 @@ case "${train_mode}" in
   csall|cs_all|cs-all)
     default_train_set=train_lidseq_csall_yodas
     default_valid_set=valid_lidseq_csall_yodas
-    [ -n "${cs_yodas_root}" ] || {
+    [ "${stage}" -gt 1 ] || [ -n "${cs_yodas_root}" ] || {
       echo "Error: --train_mode csall requires --cs_yodas_root" >&2
       exit 2
     }
@@ -277,15 +408,66 @@ if [ -z "${asr_tag}" ]; then
   esac
 fi
 [ -z "${asr_stats_dir}" ] && asr_stats_dir="exp/asr_stats_${asr_tag}"
-if [ -z "${test_sets}" ]; then
-  test_sets="test_fleurs_lid test_cs_read_test test_cs_xtts_test1 test_cs_xtts_test2 test_cs_mms_test test_cs_all"
-  case "${train_mode}" in
-    csall|cs_all|cs-all) test_sets+=" test_yodas_lidseq" ;;
-  esac
+
+# A new unfrozen phase must not silently resume the parent optimizer/scheduler.
+if [ "${stage}" -le 11 ] && [ "${stop_stage}" -ge 11 ]; then
+  run_checkpoint="exp/asr_${asr_tag}/checkpoint.pth"
+  if "${resume}"; then
+    [ "${stage}" -eq 11 ] || {
+      echo "Error: resume training with --stage 11; do not regenerate data/stats for an existing phase." >&2
+      exit 2
+    }
+    [ -s "${run_checkpoint}" ] || {
+      echo "Error: --resume true requires this phase's ${run_checkpoint}" >&2
+      exit 2
+    }
+    [ -z "${pretrained_model}" ] || {
+      echo "Error: choose either --resume true or --pretrained_model, not both." >&2
+      exit 2
+    }
+  else
+    [ ! -e "exp/asr_${asr_tag}/config.yaml" ] && [ ! -e "${run_checkpoint}" ] || {
+      echo "Error: experiment already exists; use its matching --resume true or a new --asr_tag." >&2
+      exit 2
+    }
+    if [ "${training_phase}" = unfrozen ]; then
+      [ -n "${pretrained_model}" ] && [ -s "${pretrained_model}" ] || {
+        echo "Error: a new unfrozen phase requires --pretrained_model pointing to your chosen frozen model weights." >&2
+        exit 2
+      }
+      pretrained_model=$(readlink -f "${pretrained_model}")
+      case "$(basename "${pretrained_model}")" in
+        checkpoint.pth)
+          echo "Error: select model-only epoch weights, not the optimizer-containing checkpoint.pth." >&2
+          exit 2
+          ;;
+      esac
+    elif [ -n "${pretrained_model}" ]; then
+      echo "Error: the frozen phase starts from pretrained MMS, not --pretrained_model." >&2
+      exit 2
+    fi
+  fi
+  # argparse accepts abbreviated flags; checking full flag names alone would
+  # still let --output_d or --model_conf bypass the checked run policy.
+  [ -z "${asr_args}" ] || {
+    echo "Error: training --asr_args is not supported (${asr_args}); use the explicit config and phase/resume options." >&2
+    exit 2
+  }
+  asr_args="--resume ${resume}"
 fi
-if [ -z "${cs_root}" ]; then
-  echo "Warning: --cs_root is empty. Only FLEURS data will be prepared unless CS_FLEURS_ROOT is set." >&2
+validate_phase_config
+if [ -z "${test_sets}" ]; then
   test_sets="test_fleurs_lid"
+  if [ -n "${cs_root}" ] || [ -d data/test_cs_read_test ]; then
+    test_sets+=" test_cs_read_test test_cs_xtts_test1 test_cs_xtts_test2 test_cs_mms_test"
+  fi
+  if [ -n "${cs_yodas_root}" ] || [ -d data/test_yodas_lidseq ]; then
+    test_sets+=" test_yodas_lidseq"
+  fi
+fi
+if [ "${stage}" -le 1 ] && [ "${train_mode}" = mixed ] && [ -z "${cs_root}" ]; then
+  echo "Error: mixed data preparation requires --cs_root." >&2
+  exit 2
 fi
 
 local_data_opts=(
@@ -301,7 +483,6 @@ local_data_opts=(
   --cs_dev_ratio "${cs_dev_ratio}"
   --cs_split_mode "${cs_split_mode}"
   --cs_pair_field "${cs_pair_field}"
-  --cs_yodas_root "${cs_yodas_root}"
   --cs_yodas_train_ratio "${cs_yodas_train_ratio}"
   --cs_yodas_valid_ratio "${cs_yodas_valid_ratio}"
   --cs_yodas_split_seed "${cs_yodas_split_seed}"
@@ -320,13 +501,24 @@ local_data_opts=(
   --nlsyms_txt "${nlsyms_txt}"
 )
 [ -n "${cs_root}" ] && local_data_opts+=(--cs_root "${cs_root}")
+[ -n "${cs_yodas_root}" ] && local_data_opts+=(--cs_yodas_root "${cs_yodas_root}")
 [ -n "${fleurs_cache_dir}" ] && local_data_opts+=(--fleurs_cache_dir "${fleurs_cache_dir}")
 [ -n "${fleurs_manifest_root}" ] && local_data_opts+=(--fleurs_manifest_root "${fleurs_manifest_root}")
+[ -n "${fleurs_audio_root}" ] && local_data_opts+=(--fleurs_audio_root "${fleurs_audio_root}")
 [ -n "${label_map}" ] && local_data_opts+=(--label_map "${label_map}")
 
+if [ "${stage}" -le 1 ]; then
+  for root in "${fleurs_tsv_root}" "${fleurs_audio_root}" "${fleurs_manifest_root}" "${fleurs_download_dir}" "${fleurs_cache_dir}" "${cs_root}" "${cs_yodas_root}" "${label_map}"; do
+    case "${root}" in
+      *[[:space:]]*)
+        echo "Error: wrapper Stage 1 does not support whitespace in input paths. Run local/data.sh directly with quoted paths, then start the wrapper at Stage 3." >&2
+        exit 2 ;;
+    esac
+  done
+fi
+
 # Need the actual post-filter train-set count before training.  Prepare data once
-# here, generate a config, then let asr.sh run normally.  local/data.sh is
-# deterministic/idempotent; the second call inside asr.sh should reproduce dirs.
+# here, generate a config, and skip the already-completed template stage 1.
 gen_prefix="${generated_config_dir}/${base_name}_${train_set}_bs${train_batch_size}_ag${accum_grad}_eb${effective_batch_size}_${schedule_name}"
 
 validate_generated_budget() {
@@ -350,6 +542,10 @@ validate_generated_budget() {
 
 budget_prepared_data=false
 if "${auto_training_budget}" && [ "${stage}" -le 10 ] && [ "${stop_stage}" -ge 10 ]; then
+  if [ "${stage}" -gt 1 ] && [ ! -s "data/${train_set}/${budget_count_file}" ]; then
+    echo "Error: missing prepared data for ${train_set}; run Stage 1 explicitly. Resume never regenerates data." >&2
+    exit 2
+  fi
   if [ ! -s "data/${train_set}/${budget_count_file}" ] || [ "${stage}" -le 1 ]; then
     echo "Preparing data before generating ${schedule_name} training budget for ${train_set}" >&2
     local/data.sh "${local_data_opts[@]}"
@@ -388,7 +584,7 @@ if "${auto_training_budget}" && [ "${stage}" -le 10 ] && [ "${stop_stage}" -ge 1
   cat "data/local/budget_asr_${train_set}_bs${train_batch_size}_ag${accum_grad}.log" >&2
   validate_generated_budget "${gen_prefix}.budget.json" >&2
   asr_config="${gen_prefix}.yaml"
-elif "${auto_training_budget}" && [ "${stage}" -gt 10 ] && [ "${stop_stage}" -ge 11 ]; then
+elif "${auto_training_budget}" && [ "${stage}" -eq 11 ] && [ "${stop_stage}" -ge 11 ]; then
   case "${asr_config}" in
     ${generated_config_dir}/*.yaml)
       [ -s "${asr_config}" ] || {
@@ -410,10 +606,11 @@ elif "${auto_training_budget}" && [ "${stage}" -gt 10 ] && [ "${stop_stage}" -ge
   esac
 fi
 
-if "${budget_prepared_data}" && ! "${skip_fleurs}" && [ -z "${fleurs_manifest_root}" ]; then
-  # Freeze the TSVs that were just used for budget generation before asr.sh
-  # calls local/data.sh again.
-  local_data_opts+=(--skip_fleurs_download true --fleurs_tsv_root "${fleurs_tsv_root}")
+validate_phase_config "${resume}"
+
+asr_stage=${stage}
+if "${budget_prepared_data}" && [ "${asr_stage}" -le 1 ]; then
+  asr_stage=2
 fi
 local_data_opts_str="${local_data_opts[*]}"
 
@@ -444,7 +641,7 @@ resolve_lidseq_decode_dir() {
 }
 
 ./asr.sh \
-  --stage "${stage}" \
+  --stage "${asr_stage}" \
   --stop_stage "${asr_stop_stage}" \
   --ngpu "${ngpu}" \
   --num_nodes "${num_nodes}" \

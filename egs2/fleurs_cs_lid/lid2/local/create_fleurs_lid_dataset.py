@@ -1,1 +1,0 @@
-../../lid1/local/create_fleurs_lid_dataset.py

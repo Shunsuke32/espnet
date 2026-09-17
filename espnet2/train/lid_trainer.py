@@ -156,30 +156,40 @@ class LIDTrainer(Trainer):
                         num_recheck += 1
                         continue
                 if _utt_id not in utt_id_whole_list:
+                    if _lid_label is None:
+                        target_langs = None
+                    elif _lid_label.numel() == 1 and not _lid_label.is_floating_point():
+                        target_langs = [idx2lang[_lid_label.item()]]
+                    else:
+                        target_langs = [
+                            idx2lang[label]
+                            for label in (_lid_label > 0).nonzero().flatten().tolist()
+                        ]
                     # Restrict the number of utterances per language when plotting tsne
                     if (
                         max_num_utt_per_lang is not None
                         and lang_counter_dic is not None
                         and _lid_label is not None
                     ):
-                        if (
-                            lang_counter_dic[idx2lang[_lid_label.item()]]
-                            >= max_num_utt_per_lang
+                        if any(
+                            lang_counter_dic[lang] >= max_num_utt_per_lang
+                            for lang in target_langs
                         ):
                             logging.info(
-                                f"[Rank {rank}] Language {idx2lang[_lid_label.item()]} "
+                                f"[Rank {rank}] Languages {target_langs} "
                                 f"reach max_num_utt_per_lang: {max_num_utt_per_lang}."
                             )
                             continue
                         else:
-                            lang_counter_dic[idx2lang[_lid_label.item()]] += 1
+                            for lang in target_langs:
+                                lang_counter_dic[lang] += 1
 
                     utt_id_whole_list.append(_utt_id)
                     if idx % world_size == rank:
                         utt_id_list.append(_utt_id)
                         speech_list.append(_speech)
                         speech_length_list.append(_speech_length)
-                        lid_label_list.append(_lid_label)
+                        lid_label_list.append(target_langs)
                     idx += 1
 
                     if len(utt_id_list) == custom_bs:
@@ -227,8 +237,8 @@ class LIDTrainer(Trainer):
                             if extract_embd and _lid_label_target is not None:
                                 # Save lang to embeddings dictionary
                                 _lang_embd_numpy = _lang_embd.detach().cpu().numpy()
-                                target_lid = idx2lang[_lid_label_target.item()]
-                                lang_to_embds_dic[target_lid].append(_lang_embd_numpy)
+                                for target_lid in _lid_label_target:
+                                    lang_to_embds_dic[target_lid].append(_lang_embd_numpy)
                                 lang_embd_dic[uid] = _lang_embd_numpy
 
                             lang_id_dic[uid] = _pred_lid
@@ -305,8 +315,8 @@ class LIDTrainer(Trainer):
                 if extract_embd and _lid_label_target is not None:
                     # Save lang to embeddings dictionary
                     _lang_embd_numpy = _lang_embd.detach().cpu().numpy()
-                    target_lid = idx2lang[_lid_label_target.item()]
-                    lang_to_embds_dic[target_lid].append(_lang_embd_numpy)
+                    for target_lid in _lid_label_target:
+                        lang_to_embds_dic[target_lid].append(_lang_embd_numpy)
                     lang_embd_dic[uid] = _lang_embd_numpy
 
                 lang_id_dic[uid] = _pred_lid

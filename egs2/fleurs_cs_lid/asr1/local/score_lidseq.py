@@ -16,6 +16,7 @@ present while an encoder-decoder may also learn an order.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 from collections import Counter, defaultdict
@@ -121,6 +122,25 @@ def read_sequences(
 
 def safe_div(a: float, b: float) -> float:
     return a / b if b else 0.0
+
+
+def read_detail_hypotheses(paths, ref, mapping):
+    """Aggregate disjoint scored subsets, verifying their references again."""
+    hyp = {}
+    for path in paths:
+        with path.open(encoding="utf-8", newline="") as handle:
+            rows = csv.DictReader(handle, delimiter="\t")
+            if not {"utt", "ref", "hyp"}.issubset(rows.fieldnames or []):
+                raise ValueError(f"missing required details columns: {path}")
+            for row in rows:
+                utt = row["utt"]
+                if utt in hyp:
+                    raise ValueError(f"duplicate utterance across details: {utt}")
+                actual_ref = parse_labels(row["ref"].split(), mapping, unique=False)
+                if utt not in ref or ref[utt] != actual_ref:
+                    raise ValueError(f"aggregate/subset reference mismatch: {utt}")
+                hyp[utt] = parse_labels(row["hyp"].split(), mapping, unique=False)
+    return hyp
 
 
 def f1(p: float, r: float) -> float:
@@ -232,7 +252,11 @@ def main() -> None:
     parser.add_argument(
         "--ref", type=Path, required=True, help="utt2langs or text reference"
     )
-    parser.add_argument("--hyp", type=Path, required=True, help="ESPnet decoded text")
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--hyp", type=Path, help="ESPnet decoded text")
+    inputs.add_argument(
+        "--details_inputs", type=Path, nargs="+", help="disjoint scored subset TSVs"
+    )
     parser.add_argument("--label_map", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--details_out", type=Path, default=None)
@@ -250,12 +274,27 @@ def main() -> None:
 
     mapping = read_label_map(args.label_map)
     ref = read_sequences(args.ref, mapping, unique=False)
-    hyp = read_sequences(args.hyp, mapping, unique=False)
+    if not ref:
+        raise ValueError("empty evaluation reference")
+    hyp = (
+        read_sequences(args.hyp, mapping, unique=False)
+        if args.hyp is not None
+        else read_detail_hypotheses(args.details_inputs, ref, mapping)
+    )
     for utt, labels in ref.items():
         if len(labels) != len(set(labels)):
             raise ValueError(f"duplicate reference labels for {utt}: {labels}")
     metrics = score(ref, hyp)
     details = metrics.pop("_details")
+
+    if not args.allow_missing_hyp and metrics["num_missing_hyp"] != 0:
+        raise SystemExit(
+            f"missing hypotheses: {metrics['num_missing_hyp']} / {metrics['num_ref']}"
+        )
+    if not args.allow_extra_hyp and metrics["num_extra_hyp"] != 0:
+        raise SystemExit(
+            f"extra hypotheses: {metrics['num_extra_hyp']} / {metrics['num_hyp']}"
+        )
 
     if args.details_out:
         args.details_out.parent.mkdir(parents=True, exist_ok=True)
@@ -269,14 +308,6 @@ def main() -> None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text + "\n", encoding="utf-8")
     print(text)
-    if not args.allow_missing_hyp and metrics["num_missing_hyp"] != 0:
-        raise SystemExit(
-            f"missing hypotheses: {metrics['num_missing_hyp']} / {metrics['num_ref']}"
-        )
-    if not args.allow_extra_hyp and metrics["num_extra_hyp"] != 0:
-        raise SystemExit(
-            f"extra hypotheses: {metrics['num_extra_hyp']} / {metrics['num_hyp']}"
-        )
 
 
 if __name__ == "__main__":

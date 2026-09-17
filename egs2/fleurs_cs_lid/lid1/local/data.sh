@@ -37,6 +37,7 @@ nlsyms_txt=data/nlsyms.txt
 fleurs_config=all
 fleurs_download_dir=${FLEURS:-downloads/fleurs}
 fleurs_tsv_root=
+fleurs_audio_root=
 fleurs_cache_dir=downloads/cache
 fleurs_revision=70bb2e84b976b7e960aa89f1c648e09c59f894dd
 fleurs_manifest_root=
@@ -79,6 +80,15 @@ max_eval_duration_sec=0.0
 duration_missing_policy=warn
 
 . utils/parse_options.sh
+
+if "${skip_fleurs_download}"; then
+  # This path consumes existing TSV/JSONL and audio only. Never fall back to HF.
+  export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+fi
+
+if [ "${cs_split_mode}" != global_hash ] || [ "${cs_dev_ratio}" != 0.02 ]; then
+  fail "only the OLD global_hash --cs_dev_ratio 0.02 split is supported"
+fi
 
 if [ -z "${fleurs_tsv_root}" ]; then
   fleurs_tsv_root="${fleurs_download_dir}/${fleurs_config}"
@@ -134,6 +144,7 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     opts+=(--fleurs_tsv_root "${fleurs_tsv_root}")
   fi
   [ -n "${fleurs_cache_dir}" ] && opts+=(--fleurs_cache_dir "${fleurs_cache_dir}")
+  [ -n "${fleurs_audio_root}" ] && opts+=(--fleurs_audio_root "${fleurs_audio_root}")
   [ -n "${cs_root}" ] && opts+=(--cs_root "${cs_root}")
   [ -n "${label_map}" ] && opts+=(--label_map "${label_map}")
   "${python}" local/prepare_fleurs_cs_lid_data.py "${opts[@]}"
@@ -191,6 +202,9 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
       --require_cs "${verify_require_cs}" \
       --extra_sets "${verify_extra_sets}" \
       --allow_pair_labels true \
+      --min_train_duration_sec "${min_train_duration_sec}" \
+      --max_non_yodas_train_duration_sec "${max_train_duration_sec}" \
+      --max_yodas_train_duration_sec "${cs_yodas_max_train_valid_duration_sec}" \
       --max_train_duration_sec "${verify_max_duration}"
   fi
 fi
