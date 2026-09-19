@@ -1,0 +1,117 @@
+# VoxLingua107 LID recipe
+
+For implementation changes, validation results, and migration to another server,
+see [README_handoff.md](README_handoff.md).
+
+Place the extracted corpus under `/mlnas/mitsumori/dataset/voxlingua107`.
+Training audio is expected under `<lang>/` and development audio under
+`dev/<lang>/`. Set `dataset_dir` to use another source location.
+
+Like the manifest-building ASR recipe (`mini_an4`), generated data stays in the
+recipe, separate from the source corpus:
+
+```text
+data/voxlingua107/{train,dev}/  # manifest.tsv and source-local label mappings
+exp/stats/{train,valid}/       # speech_shape and combined-dataset label mappings
+exp/<exp_tag>/                # checkpoints and inference results
+```
+
+Audio is read directly from the source; it is not copied to `dump/`. Builder and
+Dataset use `data_dir: ${data_dir}/voxlingua107` for generated manifests. The
+default `data_dir` is `${recipe_dir}/data`. Existing `<source>/espnet3/` files are
+left untouched and are no longer used by the shipped configs. Manifest audio
+paths remain absolute: after relocating audio, rebuild manifests in a fresh
+`data_dir` and rerun `collect_stats` before training. If overriding `data_dir` or
+`stats_dir`, use the same paths in training, inference, and publication configs.
+
+For multiple training datasets, add entries to `dataset.train` (and `valid`),
+then rerun `collect_stats`. The LID collector writes `category2utt` and `lang2utt`
+with the same combined indices as `speech_shape`; the sampler and preprocessor
+read these combined mappings, not one corpus's local indices. Distinct source
+corpora need distinct manifest directories. Raw samples must have a string
+`lid_labels` language code; update `model.lang_num` if the language inventory
+changes. Changing dataset order also requires recollecting statistics.
+
+The collector also writes `dataset2utt`/`utt2dataset`, with source positions
+(`0`, `1`, ...) as dataset IDs. To use `catpow_balance_dataset`, point each split's
+`batches.dataset2utt_parent_dir` at `${stats_dir}/train` or `${stats_dir}/valid`
+and set `category_upsampling_factor` and `dataset_upsampling_factor`.
+
+The template keeps an integer iterator seed of `0` when top-level `seed` is
+unset. This recipe explicitly passes `${seed}` to both iterators, so its default
+`3702` controls their shuffle and worker seeds too. This changes data ordering
+relative to older configs that implicitly used iterator seed `0`.
+
+```bash
+voxlingua_root=/mlnas/mitsumori/dataset/voxlingua107
+mkdir -p "${voxlingua_root}/dev"
+curl -fL -o "${voxlingua_root}/zip_urls.txt" \
+  https://cs.taltech.ee/staff/tanel.alumae/data/voxlingua107/zip_urls.txt
+wget --continue --directory-prefix="${voxlingua_root}" \
+  --input-file="${voxlingua_root}/zip_urls.txt"
+curl -fL --continue-at - -o "${voxlingua_root}/dev.zip" \
+  https://cs.taltech.ee/staff/tanel.alumae/data/voxlingua107/dev.zip
+find "${voxlingua_root}" -maxdepth 1 -name '*.zip' ! -name dev.zip \
+  -exec unzip -q -o {} -d "${voxlingua_root}" \;
+unzip -q -o "${voxlingua_root}/dev.zip" -d "${voxlingua_root}/dev"
+```
+
+```bash
+python run.py --stages create_dataset --training_config conf/training.yaml
+python run.py --stages collect_stats --training_config conf/training.yaml
+python run.py --stages train --training_config conf/training.yaml
+python run.py --stages infer \
+  --training_config conf/training.yaml \
+  --inference_config conf/inference.yaml
+python run.py --stages measure \
+  --training_config conf/training.yaml \
+  --inference_config conf/inference.yaml \
+  --metrics_config conf/metrics.yaml
+python run.py --stages pack_model \
+  --training_config conf/training.yaml \
+  --inference_config conf/inference.yaml \
+  --metrics_config conf/metrics.yaml \
+  --publication_config conf/publication.yaml
+python run.py --stages upload_model \
+  --training_config conf/training.yaml \
+  --publication_config conf/publication.yaml
+```
+
+## External evaluation data
+
+See [external_evaluation.md](external_evaluation.md) for Babel, FLEURS,
+ML-SUPERB 2.0 (including dialects), and VoxPopuli. The adapters reuse prepared
+ESPnet2 data and evaluate the intersection with the model's language inventory.
+They do not automatically download corpora or reconstruct the published
+external test splits.
+
+## Embeddings and t-SNE
+
+Label-only inference remains the default. Enable optional normalized language
+embeddings and t-SNE through the existing infer and measure stages:
+
+```bash
+python run.py --stages infer measure \
+  --training_config conf/training.yaml \
+  --inference_config conf/inference_embeddings.yaml \
+  --metrics_config conf/metrics_embeddings.yaml
+```
+
+Outputs are separate from label-only inference, under
+`${exp_dir}/inference_embeddings/<test_name>/`:
+
+- `embedding.scp` and per-utterance `.npy` files;
+- `<test_name>_lang_to_embds.npz` and normalized language means in
+  `<test_name>_lang_to_avg_embd.npz`;
+- `tsne_plots/`, generated by the existing ESPnet2 plotting function.
+
+The recipe summarizes at most 100 utterances per reference language, matching
+the ESPnet2 VoxLingua setting. Unlike its inference-time cap, this cap applies
+after full inference, only to embedding summaries and plots. Set the metric's
+`inputs.ref: hyp` to group embeddings by predicted languages instead.
+Perplexity is capped below the number of plotted points for small datasets.
+Plotting dependencies are loaded only when requested: matplotlib/pandas for
+PNG/CSV, optional plotly for HTML and adjustText for label positioning.
+
+Standard measure also writes `lid_per_language.json` and
+`lid_error_counts.json`. Existing scalar metrics and `lid_errors` are retained.

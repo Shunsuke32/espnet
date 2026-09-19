@@ -1,0 +1,34 @@
+defaults:
+  - inference
+  - _self_
+
+# Prepared ESPnet2 evaluation splits; see readme.md for preparation commands.
+external_data_dir: /mlnas/mitsumori/dataset/lid_evaluation
+
+dataset:
+  test:
+    - name: babel
+      data_src: egs3.voxlingua107.lid.src.external_dataset
+      data_src_args:
+        data_dir: ${external_data_dir}/babel
+        train_lang2utt: ${model.lang2utt}
+    - name: fleurs
+      data_src: egs3.voxlingua107.lid.src.external_dataset
+      data_src_args:
+        data_dir: ${external_data_dir}/fleurs
+        train_lang2utt: ${model.lang2utt}
+    - name: ml_superb2
+      data_src: egs3.voxlingua107.lid.src.external_dataset
+      data_src_args:
+        data_dir: ${external_data_dir}/ml_superb2
+        train_lang2utt: ${model.lang2utt}
+    - name: ml_superb2_dialect
+      data_src: egs3.voxlingua107.lid.src.external_dataset
+      data_src_args:
+        data_dir: ${external_data_dir}/ml_superb2_dialect
+        train_lang2utt: ${model.lang2utt}
+    - name: voxpopuli
+      data_src: egs3.voxlingua107.lid.src.external_dataset
+      data_src_args:
+        data_dir: ${external_data_dir}/voxpopuli
+        train_lang2utt: ${model.lang2utt}

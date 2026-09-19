@@ -1,0 +1,13 @@
+builder:
+  default_source_dir: /mlnas/mitsumori/dataset/voxlingua107
+  data_path: data/voxlingua107
+  excluded_train_dirs:
+    - dev
+    - espnet3
+    - musan
+    - RIRS_NOISES
+
+dataset:
+  supported_splits:
+    - train
+    - dev
